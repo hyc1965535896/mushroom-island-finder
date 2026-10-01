@@ -826,6 +826,7 @@ public class FindMushroomIslands {
         AtomicLong scanned = new AtomicLong();
         AtomicInteger rowCur = new AtomicInteger();
         AtomicBoolean stopped = new AtomicBoolean(false);
+        final boolean hitsDebug = Boolean.getBoolean("hits.debug");
 
         // ---- 阶段1: 并行逐行扫描, 只收集蘑菇命中点 (流式, 支持全图尺寸) ----
         Thread[] workers = new Thread[Math.max(1, c.threads)];
@@ -834,7 +835,7 @@ public class FindMushroomIslands {
             workers[w] = new Thread(() -> {
                 BiomeNoise bn = new BiomeNoise(c.ver);
                 bn.setSeed(c.seed, c.large);
-                long[] buf = new long[4096];
+                long[] buf = new long[256]; // 攒满256条立即发布给实时预览
                 int n = 0;
                 for (int j = rowCur.getAndIncrement(); j < gh;
                         j = rowCur.getAndIncrement()) {
@@ -848,10 +849,11 @@ public class FindMushroomIslands {
                         int x = c.minX + i * c.step + c.step / 2;
                         int qx = x >> 2;
                         if (sampleBiomeNoise(bn, null, qx, c.yq, qz) == B_MUSHROOM) {
+                            if (hitsDebug) System.err.println("HIT " + x + "," + z + " row" + j);
                             if (n == buf.length) {
                                 if (ctx != null)
                                     synchronized (ctx.chunks) { ctx.chunks.add(buf); }
-                                buf = new long[4096];
+                                buf = new long[buf.length];
                                 n = 0;
                             }
                             buf[n++] = ((long) i << 32) | (j & 0xFFFFFFFFL);
@@ -877,7 +879,7 @@ public class FindMushroomIslands {
 
         // ---- 阶段4: 细化(数量过多时取面积最大的前5万个) + 按真实面积筛选 ----
         prog.phase(t("细化中...", "Refining..."));
-        int refineLimit = Math.min(out.size(), 50000);
+        int refineLimit = Math.min(out.size(), 5000);
         long tLastRefine = 0;
         for (int i = 0; i < refineLimit; i++) {
             refine(c, out.get(i));
@@ -1168,7 +1170,7 @@ public class FindMushroomIslands {
     //==========================================================================
     //                              图形界面
     //==========================================================================
-    static final String VERSION = "1.5";
+    static final String VERSION = "1.6";
 
     static boolean LANG_EN = false;
 
@@ -1632,7 +1634,8 @@ public class FindMushroomIslands {
                         SwingUtilities.invokeLater(() -> {
                             if (!done) f.output.setText(text);
                         });
-                    } catch (Exception ignored) {
+                    } catch (Throwable ex) {
+                        ex.printStackTrace();
                     } finally { previewBusy.set(false); }
                 }
                 long now = System.currentTimeMillis();
