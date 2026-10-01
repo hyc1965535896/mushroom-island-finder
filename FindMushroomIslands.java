@@ -777,6 +777,7 @@ public class FindMushroomIslands {
 
     interface Progress {
         void update(long scanned, long total);
+        void phase(String s);
         /** 返回 false 表示要求停止 */
         boolean running();
     }
@@ -793,18 +794,40 @@ public class FindMushroomIslands {
     static final int[] REFINE_Y = {12, 14, 16, 18, 20, 22}; // quart, 方块48~90
 
     /** 扫描一个种子, 返回按面积降序的蘑菇岛列表(已细化)。被停止时返回 null。 */
-    static List<Island> scanSeed(Cfg c, Progress prog) {
+    /** 扫描上下文: 保存命中块, 供界面在扫描过程中做实时预览。 */
+    static final class ScanCtx {
+        final java.util.List<long[]> chunks =
+                java.util.Collections.synchronizedList(new ArrayList<>());
+        volatile int gw, gh;
+    }
+
+    static long[] snapshotChunks(ScanCtx ctx) {
+        int n = 0;
+        synchronized (ctx.chunks) {
+            for (long[] b : ctx.chunks) n += b.length;
+        }
+        long[] out = new long[n];
+        int p = 0;
+        synchronized (ctx.chunks) {
+            for (long[] b : ctx.chunks) {
+                System.arraycopy(b, 0, out, p, b.length);
+                p += b.length;
+            }
+        }
+        return out;
+    }
+
+    static List<Island> scanSeed(Cfg c, Progress prog, ScanCtx ctx) {
         int gw = (c.maxX - c.minX) / c.step;
         int gh = (c.maxZ - c.minZ) / c.step;
+        if (ctx != null) { ctx.gw = gw; ctx.gh = gh; }
         long total = (long) gw * gh;
         AtomicLong scanned = new AtomicLong();
         AtomicInteger rowCur = new AtomicInteger();
         AtomicBoolean stopped = new AtomicBoolean(false);
 
-        // ---- 阶段1: 并行逐行扫描, 只收集蘑菇命中点 (v1.3: 流式, 不分配整幅网格,
-        //      支持全图尺寸; 内存与命中数成正比) ----
+        // ---- 阶段1: 并行逐行扫描, 只收集蘑菇命中点 (流式, 支持全图尺寸) ----
         Thread[] workers = new Thread[Math.max(1, c.threads)];
-        final long[][] hitBufs = new long[workers.length][];
         for (int w = 0; w < workers.length; w++) {
             final int wid = w;
             workers[w] = new Thread(() -> {
@@ -824,15 +847,20 @@ public class FindMushroomIslands {
                         int x = c.minX + i * c.step + c.step / 2;
                         int qx = x >> 2;
                         if (sampleBiomeNoise(bn, null, qx, c.yq, qz) == B_MUSHROOM) {
-                            if (n == buf.length)
-                                buf = Arrays.copyOf(buf, buf.length * 2);
+                            if (n == buf.length) {
+                                if (ctx != null)
+                                    synchronized (ctx.chunks) { ctx.chunks.add(buf); }
+                                buf = new long[4096];
+                                n = 0;
+                            }
                             buf[n++] = ((long) i << 32) | (j & 0xFFFFFFFFL);
                         }
                     }
                     prog.update(scanned.addAndGet(gw), total);
                 }
-                hitBufs[wid] = Arrays.copyOf(buf, n);
-            }, "scan-" + w);
+                if (n > 0 && ctx != null)
+                    synchronized (ctx.chunks) { ctx.chunks.add(Arrays.copyOf(buf, n)); }
+            }, "scan-" + wid);
             workers[w].start();
         }
         for (Thread t : workers) {
@@ -842,20 +870,30 @@ public class FindMushroomIslands {
         }
         if (stopped.get()) return null;
 
-        long[] hits;
-        {
-            long cnt = 0;
-            for (long[] b : hitBufs) cnt += b.length;
-            hits = new long[(int) cnt];
-            int p = 0;
-            for (long[] b : hitBufs) {
-                System.arraycopy(b, 0, hits, p, b.length);
-                p += b.length;
-            }
-        }
+        // ---- 阶段2+3: 并查集把相邻命中聚成候选岛 ----
+        List<Island> out = coarseIslands(snapshotChunks(ctx), c);
+        out.sort((a, b) -> Long.compare(b.area, a.area));
 
-        // ---- 阶段2: 并查集把相邻命中(4连通)聚成岛 ----
+        // ---- 阶段4: 细化(数量过多时取面积最大的前5万个) + 按真实面积筛选 ----
+        prog.phase(t("细化中...", "Refining..."));
+        int refineLimit = Math.min(out.size(), 50000);
+        for (int i = 0; i < refineLimit; i++)
+            refine(c, out.get(i));
+
+        List<Island> kept = new ArrayList<>();
+        for (Island isl : out)
+            if (isl.area >= c.minArea)
+                kept.add(isl);
+        kept.sort((a, b) -> Long.compare(b.area, a.area));
+        if (kept.size() > c.top) kept.subList(c.top, kept.size()).clear();
+        return kept;
+    }
+
+    /** 把命中点按 4 连通聚成候选岛 (并查集)。 */
+    static List<Island> coarseIslands(long[] hits, Cfg c) {
         int n = hits.length;
+        List<Island> out = new ArrayList<>();
+        if (n == 0) return out;
         HashMap<Long, Integer> cellIdx = new HashMap<>(Math.max(16, n * 2));
         int[] parent = new int[n];
         int[] cntA = new int[n];
@@ -877,9 +915,6 @@ public class FindMushroomIslands {
                 hsUnion(parent, cntA, sumI, sumJ, minI, maxI, minJ, maxJ,
                         k, cellIdx.get((((long) i) << 32) | ((j - 1) & 0xFFFFFFFFL)));
         }
-
-        // ---- 阶段3: 由各连通分量生成候选岛 ----
-        List<Island> out = new ArrayList<>();
         for (int k = 0; k < n; k++) {
             if (hsFind(parent, k) != k) continue;
             Island isl = new Island();
@@ -891,20 +926,39 @@ public class FindMushroomIslands {
             isl.dist = Math.hypot(isl.cx, isl.cz);
             out.add(isl);
         }
-        out.sort((a, b) -> Long.compare(b.area, a.area));
+        return out;
+    }
 
-        // ---- 阶段4: 细化(数量过多时取面积最大的前5万个) + 按真实面积筛选 ----
-        int refineLimit = Math.min(out.size(), 50000);
-        for (int i = 0; i < refineLimit; i++)
-            refine(c, out.get(i));
-
-        List<Island> kept = new ArrayList<>();
-        for (Island isl : out)
-            if (isl.area >= c.minArea)
-                kept.add(isl);
-        kept.sort((a, b) -> Long.compare(b.area, a.area));
-        if (kept.size() > c.top) kept.subList(c.top, kept.size()).clear();
-        return kept;
+    /** 扫描过程中的实时预览文本 (在后台线程调用)。 */
+    static String previewText(Cfg c, ScanCtx ctx, long scanned, long total) {
+        long[] hits = snapshotChunks(ctx);
+        StringBuilder sb = new StringBuilder();
+        double pct = total > 0 ? 100.0 * scanned / total : 0;
+        sb.append(String.format(t("【预览 · 已扫 %.1f%% · 非最终结果】%n",
+                "[Preview · %.1f%% scanned · not final]%n"), pct));
+        if (hits.length == 0) {
+            sb.append(t("尚未命中蘑菇岛采样点…\n", "No mushroom sample hit yet...\n"));
+            return sb.toString();
+        }
+        List<Island> prev = coarseIslands(hits, c);
+        prev.sort((a, b) -> Long.compare(b.area, a.area));
+        int limR = Math.min(20, prev.size());
+        for (int i = 0; i < limR; i++)
+            refine(c, prev.get(i));
+        prev.sort((a, b) -> Long.compare(b.area, a.area));
+        int lim = Math.min(10, prev.size());
+        for (int i = 0; i < lim; i++) {
+            Island isl = prev.get(i);
+            sb.append(String.format(
+                    "#%-3d %s (%d, %d)  %s %d x %d  %s ≈ %,d %s%n",
+                    i + 1, t("中心", "center"), isl.cx, isl.cz,
+                    t("范围", "size"), isl.w, isl.h,
+                    t("面积", "area"), isl.area, t("方块²(粗估)", "blocks²(rough)")));
+        }
+        sb.append(String.format(t("(命中 %d 格 / 候选 %d 岛; 扫描完成后输出精确结果)%n",
+                "(%d hit cells / %d candidate islands; final results after scan)%n"),
+                hits.length, prev.size(), lim));
+        return sb.toString();
     }
 
     static int hsFind(int[] parent, int x) {
@@ -1081,8 +1135,9 @@ public class FindMushroomIslands {
         long t0 = System.nanoTime();
         List<Island> list = scanSeed(c, new Progress() {
             public void update(long s, long total) {}
+            public void phase(String s) {}
             public boolean running() { return true; }
-        });
+        }, new ScanCtx());
         double secs = (System.nanoTime() - t0) / 1e9;
         if (list == null || list.isEmpty()) {
             System.out.println("未找到蘑菇岛 (可尝试扩大 -r 范围)");
@@ -1101,7 +1156,7 @@ public class FindMushroomIslands {
     //==========================================================================
     //                              图形界面
     //==========================================================================
-    static final String VERSION = "1.3";
+    static final String VERSION = "1.4";
 
     static boolean LANG_EN = false;
 
@@ -1496,8 +1551,10 @@ public class FindMushroomIslands {
                 int idx = 0;
                 for (Cfg c : cfgs) {
                     if (stopFlag) break;
-                    ScanUi prog = new ScanUi(f, t0);
-                    List<Island> list = scanSeed(c, prog);
+                    ScanCtx ctx = new ScanCtx();
+                    ScanUi prog = new ScanUi(f, t0, c, ctx);
+                    List<Island> list = scanSeed(c, prog, ctx);
+                    prog.finish();
                     if (list == null) break; // 已停止
                     lastIslands = list;
                     lastSeedText = c.seedText;
@@ -1522,13 +1579,39 @@ public class FindMushroomIslands {
         class ScanUi implements Progress {
             final FormRefs f;
             final long t0;
+            final Cfg cfg;
+            final ScanCtx ctx;
             volatile long lastS, lastTotal;
-            ScanUi(FormRefs f, long t0) { this.f = f; this.t0 = t0; }
+            volatile boolean done;
+            long lastPreview = 0;
+            final java.util.concurrent.atomic.AtomicBoolean previewBusy =
+                    new java.util.concurrent.atomic.AtomicBoolean(false);
+            ScanUi(FormRefs f, long t0, Cfg cfg, ScanCtx ctx) {
+                this.f = f; this.t0 = t0; this.cfg = cfg; this.ctx = ctx;
+            }
             public void update(long s, long total) { lastS = s; lastTotal = total; }
+            public void phase(String s) {
+                SwingUtilities.invokeLater(() -> f.progressLabel.setText(s));
+            }
+            public void finish() { done = true; }
             public boolean running() {
                 if (stopFlag) return false;
                 while (pauseFlag && !stopFlag) {
                     try { Thread.sleep(80); } catch (InterruptedException e) { return false; }
+                }
+                // 实时预览: 每2秒用当前命中做一次快速聚类 (仅单种子页)
+                if (ctx != null && !f.listMode && !done
+                        && System.currentTimeMillis() - lastPreview > 2000
+                        && previewBusy.compareAndSet(false, true)) {
+                    lastPreview = System.currentTimeMillis();
+                    final long s = lastS, tt = lastTotal;
+                    try {
+                        final String text = previewText(cfg, ctx, s, tt);
+                        SwingUtilities.invokeLater(() -> {
+                            if (!done) f.output.setText(text);
+                        });
+                    } catch (Exception ignored) {
+                    } finally { previewBusy.set(false); }
                 }
                 long now = System.currentTimeMillis();
                 long el = Math.max(1, (now - t0) / 1000);
