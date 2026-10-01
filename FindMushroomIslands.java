@@ -14,7 +14,7 @@
  *   java FindMushroomIslands.java <种子> [选项]  -> 命令行模式
  *       -r 半径(方块, 默认16384)  -step 步长(默认自动)  -top N(默认12)
  *       -mc 版本(1.18|1.19.2|1.19.4|1.20.6|1.21.4, 默认1.21.4)
- *       -large 大型生物群系  -y quartY(默认16, 约方块高度64~67)
+ *       -min 最小岛面积(方块²)  -large 大型生物群系  -y quartY(默认16, 约方块高度64~67)
  *   java FindMushroomIslands.java --test      -> 算法黄金自检
  */
 import java.io.*;
@@ -764,7 +764,7 @@ public class FindMushroomIslands {
         int minX = -16384, maxX = 16384, minZ = -16384, maxZ = 16384;
         int step = 64;       // 粗扫描步长(方块)
         int yq = 16;         // 粗扫描 quart 高度 (y*4+2 ≈ 方块66)
-        int minCells = 4;    // 粗扫描最小格子数
+        long minArea = 0;    // 最小岛面积(方块², 细化后判定)
         int top = 12;
         int threads = Runtime.getRuntime().availableProcessors();
     }
@@ -784,7 +784,7 @@ public class FindMushroomIslands {
     static int autoStep(Cfg c) {
         int spanX = c.maxX - c.minX, spanZ = c.maxZ - c.minZ;
         int span = Math.max(spanX, spanZ);
-        int step = (span + 1023) / 1024; // 目标每边 ≤1024 格
+        int step = (span + 4095) / 4096; // 目标每边 ≤4096 格(实测可达数百万格/秒)
         if (step < 64) step = 64;
         step = (step + 3) / 4 * 4;
         return step;
@@ -860,7 +860,7 @@ public class FindMushroomIslands {
                 if (cj > 0      && mask[cur - gw] == 1 && !vis[cur - gw]) { vis[cur - gw] = true; stack[sp++] = cur - gw; }
                 if (cj < gh - 1 && mask[cur + gw] == 1 && !vis[cur + gw]) { vis[cur + gw] = true; stack[sp++] = cur + gw; }
             }
-            if (cnt >= c.minCells) {
+            {
                 Island isl = new Island();
                 isl.cx = c.minX + (sumI / cnt) * c.step + c.step / 2;
                 isl.cz = c.minZ + (sumJ / cnt) * c.step + c.step / 2;
@@ -872,13 +872,20 @@ public class FindMushroomIslands {
             }
         }
         out.sort((a, b) -> Long.compare(b.area, a.area));
-        if (out.size() > c.top) out.subList(c.top, out.size()).clear();
 
-        // ---- 细化: 对每个岛按更细步长 + 高度带重扫 ----
+        // ---- 细化: 对每个候选按更细步长 + 高度带重扫(数量过多时取面积最大的前5万个) ----
+        int refineLimit = Math.min(out.size(), 50000);
+        for (int i = 0; i < refineLimit; i++)
+            refine(c, out.get(i));
+
+        // ---- 按细化后的真实面积筛选 ----
+        List<Island> kept = new ArrayList<>();
         for (Island isl : out)
-            refine(c, isl);
-        out.sort((a, b) -> Long.compare(b.area, a.area));
-        return out;
+            if (isl.area >= c.minArea)
+                kept.add(isl);
+        kept.sort((a, b) -> Long.compare(b.area, a.area));
+        if (kept.size() > c.top) kept.subList(c.top, kept.size()).clear();
+        return kept;
     }
 
     static void refine(Cfg c, Island isl) {
@@ -889,7 +896,7 @@ public class FindMushroomIslands {
         int bz0 = (int) Math.max(c.minZ, (long) isl.cz - estR);
         int bz1 = (int) Math.min(c.maxZ, (long) isl.cz + estR);
         int span = Math.max(bx1 - bx0, bz1 - bz0);
-        int fs = Math.max(8, Math.max(c.step / 8, span / 900));
+        int fs = Math.max(8, Math.min(256, Math.max(c.step / 8, span / 900)));
         int fw = (bx1 - bx0) / fs + 1;
         int fh = (bz1 - bz0) / fs + 1;
         byte[] m2 = new byte[fw * fh];
@@ -1010,7 +1017,7 @@ public class FindMushroomIslands {
                           c.minX = c.minZ = -c.maxX; break;
             case "-step": c.step = Integer.parseInt(args[++i]); break;
             case "-top":  c.top = Integer.parseInt(args[++i]); break;
-            case "-min":  c.minCells = Integer.parseInt(args[++i]); break;
+            case "-min":  c.minArea = Long.parseLong(args[++i]); break;
             case "-y":    c.yq = Integer.parseInt(args[++i]); break;
             case "-mc":   c.ver = parseVer(args[++i]); break;
             case "-large": c.large = true; break;
@@ -1045,7 +1052,7 @@ public class FindMushroomIslands {
     //==========================================================================
     //                              图形界面
     //==========================================================================
-    static final String VERSION = "1.1";
+    static final String VERSION = "1.2";
 
     static boolean LANG_EN = false;
 
@@ -1067,7 +1074,7 @@ public class FindMushroomIslands {
     static class FormRefs {
         final boolean listMode;
         JTextField seedField, threadsField, minXf, maxXf, minZf, maxZf, sideField, listFileField;
-        JComboBox<String> filterBox, verBox, worldBox, langBox;
+        JComboBox<String> filterBox, verBox, worldBox, langBox, resBox;
         JCheckBox sideCheck;
         JButton startBtn, pauseBtn, stopBtn, resetBtn, exportBtn, sortBtn, browseBtn, selfTestBtn;
         JProgressBar bar;
@@ -1168,6 +1175,17 @@ public class FindMushroomIslands {
             form.add(f.worldBox, g);
             g.gridx = 2; g.fill = java.awt.GridBagConstraints.NONE;
             form.add(new JLabel(""), g);
+            row++;
+
+            g.gridx = 0; g.gridy = row;
+            form.add(new JLabel(t("分辨率(方块/格):", "Resolution (blocks/cell):")), g);
+            g.gridx = 1; g.fill = java.awt.GridBagConstraints.HORIZONTAL;
+            f.resBox = new JComboBox<>(new String[] {
+                    t("自动 (大区域自动放粗)", "Auto"),
+                    "64", "128", "256", "512", "1024", "2048", "4096" });
+            form.add(f.resBox, g);
+            g.gridx = 2; g.fill = java.awt.GridBagConstraints.NONE;
+            form.add(new JLabel(t("找大岛可用 512~1024", "512~1024 for big islands")), g);
             row++;
 
             f.minXf = new JTextField("-16384");
@@ -1369,8 +1387,10 @@ public class FindMushroomIslands {
             c.minZ = Math.max(-LIMIT, c.minZ); c.maxZ = Math.min(LIMIT, c.maxZ);
             int th = Integer.parseInt(f.threadsField.getText().trim());
             c.threads = Math.max(1, Math.min(512, th));
-            c.minCells = new int[] {4, 4, 16, 128, 512}[f.filterBox.getSelectedIndex()];
-            c.step = autoStep(c);
+            c.minArea = new long[] {0, 16384, 65536, 262144, 1048576}[f.filterBox.getSelectedIndex()];
+            int resIdx = f.resBox.getSelectedIndex();
+            c.step = resIdx == 0 ? autoStep(c)
+                    : Integer.parseInt((String) f.resBox.getSelectedItem());
             return c;
         }
 
@@ -1378,7 +1398,7 @@ public class FindMushroomIslands {
             Cfg c = new Cfg();
             c.ver = o.ver; c.large = o.large;
             c.minX = o.minX; c.maxX = o.maxX; c.minZ = o.minZ; c.maxZ = o.maxZ;
-            c.step = o.step; c.yq = o.yq; c.minCells = o.minCells;
+            c.step = o.step; c.yq = o.yq; c.minArea = o.minArea;
             c.top = o.top; c.threads = o.threads;
             return c;
         }
@@ -1499,6 +1519,9 @@ public class FindMushroomIslands {
                     t("区域: [%d, %d] x [%d, %d]  分辨率: %d方块/格%n",
                       "Region: [%d, %d] x [%d, %d]  resolution: %d blocks/cell%n"),
                     c.minX, c.maxX, c.minZ, c.maxZ, c.step));
+            if (c.step >= 1024)
+                sb.append(t("警告: 步长较大, 直径明显小于步长的蘑菇岛可能漏检; 可在\"分辨率\"中选择更细步长。\n",
+                            "Warning: coarse step, islands much smaller than the step may be missed; pick a finer resolution.\n"));
             if (list.isEmpty()) {
                 sb.append(t("未找到蘑菇岛, 可尝试扩大搜索区域。\n",
                             "No mushroom island found, try a larger region.\n"));

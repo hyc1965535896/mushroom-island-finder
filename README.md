@@ -11,7 +11,7 @@
 
 ## 下载
 
-到 [Releases](https://github.com/hyc1965535896/mushroom-island-finder/releases) 下载 `MushroomIslandFinder-1.1.jar`，双击即可运行（需已安装 Java 17+）；或下载源码后运行 `启动蘑菇岛搜索工具.bat`。
+到 [Releases](https://github.com/hyc1965535896/mushroom-island-finder/releases) 下载 `MushroomIslandFinder-1.2.jar`，双击即可运行（需已安装 Java 17+）；或下载源码后运行 `启动蘑菇岛搜索工具.bat`。
 
 ## 快速开始
 
