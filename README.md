@@ -5,6 +5,14 @@
 作者：**HYChyc114514**
 核心算法移植自开源库 [cubiomes](https://github.com/Cubitect/cubiomes)（MIT），与 Chunkbase 一致，已通过 cubiomes 官方测试基准（1.18 / 1.19.2 / 1.19.4 / 1.20.6 四套黄金哈希）与 Chunkbase 1.21.4 / 26.3 网页版双重交叉验证。
 
+## 界面截图
+
+![界面截图](docs/screenshot.png)
+
+## 下载
+
+到 [Releases](https://github.com/hyc1965535896/mushroom-island-finder/releases) 下载 `MushroomIslandFinder-1.0.jar`，双击即可运行（需已安装 Java 17+）；或下载源码后运行 `启动蘑菇岛搜索工具.bat`。
+
 ## 快速开始
 
 双击 `启动蘑菇岛搜索工具.bat`，或命令行运行：

@@ -7,3 +7,5 @@ ref_ids_*.txt
 java_ids_*.txt
 __pycache__/
 *.class
+*.jar
+build/
