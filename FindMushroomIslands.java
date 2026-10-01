@@ -797,17 +797,21 @@ public class FindMushroomIslands {
         int gw = (c.maxX - c.minX) / c.step;
         int gh = (c.maxZ - c.minZ) / c.step;
         long total = (long) gw * gh;
-        short[] ids = new short[gw * gh];
-        byte[] mask = new byte[gw * gh];
         AtomicLong scanned = new AtomicLong();
         AtomicInteger rowCur = new AtomicInteger();
         AtomicBoolean stopped = new AtomicBoolean(false);
 
+        // ---- 阶段1: 并行逐行扫描, 只收集蘑菇命中点 (v1.3: 流式, 不分配整幅网格,
+        //      支持全图尺寸; 内存与命中数成正比) ----
         Thread[] workers = new Thread[Math.max(1, c.threads)];
+        final long[][] hitBufs = new long[workers.length][];
         for (int w = 0; w < workers.length; w++) {
+            final int wid = w;
             workers[w] = new Thread(() -> {
                 BiomeNoise bn = new BiomeNoise(c.ver);
                 bn.setSeed(c.seed, c.large);
+                long[] buf = new long[4096];
+                int n = 0;
                 for (int j = rowCur.getAndIncrement(); j < gh;
                         j = rowCur.getAndIncrement()) {
                     if (!prog.running()) {
@@ -816,16 +820,18 @@ public class FindMushroomIslands {
                     }
                     int z = c.minZ + j * c.step + c.step / 2;
                     int qz = z >> 2;
-                    int base = j * gw;
                     for (int i = 0; i < gw; i++) {
                         int x = c.minX + i * c.step + c.step / 2;
                         int qx = x >> 2;
-                        int id = sampleBiomeNoise(bn, null, qx, c.yq, qz);
-                        ids[base + i] = (short) id;
-                        if (id == B_MUSHROOM) mask[base + i] = 1;
+                        if (sampleBiomeNoise(bn, null, qx, c.yq, qz) == B_MUSHROOM) {
+                            if (n == buf.length)
+                                buf = Arrays.copyOf(buf, buf.length * 2);
+                            buf[n++] = ((long) i << 32) | (j & 0xFFFFFFFFL);
+                        }
                     }
                     prog.update(scanned.addAndGet(gw), total);
                 }
+                hitBufs[wid] = Arrays.copyOf(buf, n);
             }, "scan-" + w);
             workers[w].start();
         }
@@ -836,49 +842,62 @@ public class FindMushroomIslands {
         }
         if (stopped.get()) return null;
 
-        // ---- 泛洪填充连通块 (4连通) ----
+        long[] hits;
+        {
+            long cnt = 0;
+            for (long[] b : hitBufs) cnt += b.length;
+            hits = new long[(int) cnt];
+            int p = 0;
+            for (long[] b : hitBufs) {
+                System.arraycopy(b, 0, hits, p, b.length);
+                p += b.length;
+            }
+        }
+
+        // ---- 阶段2: 并查集把相邻命中(4连通)聚成岛 ----
+        int n = hits.length;
+        HashMap<Long, Integer> cellIdx = new HashMap<>(Math.max(16, n * 2));
+        int[] parent = new int[n];
+        int[] cntA = new int[n];
+        long[] sumI = new long[n], sumJ = new long[n];
+        int[] minI = new int[n], maxI = new int[n], minJ = new int[n], maxJ = new int[n];
+        for (int k = 0; k < n; k++) {
+            parent[k] = k;
+            int i = (int) (hits[k] >>> 32), j = (int) hits[k];
+            cntA[k] = 1; sumI[k] = i; sumJ[k] = j;
+            minI[k] = maxI[k] = i; minJ[k] = maxJ[k] = j;
+            cellIdx.put(hits[k], k);
+        }
+        for (int k = 0; k < n; k++) {
+            int i = (int) (hits[k] >>> 32), j = (int) hits[k];
+            if (i > 0)
+                hsUnion(parent, cntA, sumI, sumJ, minI, maxI, minJ, maxJ,
+                        k, cellIdx.get((((long) (i - 1)) << 32) | (j & 0xFFFFFFFFL)));
+            if (j > 0)
+                hsUnion(parent, cntA, sumI, sumJ, minI, maxI, minJ, maxJ,
+                        k, cellIdx.get((((long) i) << 32) | ((j - 1) & 0xFFFFFFFFL)));
+        }
+
+        // ---- 阶段3: 由各连通分量生成候选岛 ----
         List<Island> out = new ArrayList<>();
-        boolean[] vis = new boolean[gw * gh];
-        int[] stack = new int[gw * gh];
-        for (int start = 0; start < gw * gh; start++) {
-            if (mask[start] == 0 || vis[start]) continue;
-            int sp = 0;
-            stack[sp++] = start;
-            vis[start] = true;
-            int cnt = 0, sumI = 0, sumJ = 0;
-            int i0 = gw, i1 = -1, j0 = gh, j1 = -1;
-            while (sp > 0) {
-                int cur = stack[--sp];
-                int ci = cur % gw, cj = cur / gw;
-                cnt++; sumI += ci; sumJ += cj;
-                if (ci < i0) i0 = ci;
-                if (ci > i1) i1 = ci;
-                if (cj < j0) j0 = cj;
-                if (cj > j1) j1 = cj;
-                if (ci > 0      && mask[cur - 1]  == 1 && !vis[cur - 1])  { vis[cur - 1] = true;  stack[sp++] = cur - 1; }
-                if (ci < gw - 1 && mask[cur + 1]  == 1 && !vis[cur + 1])  { vis[cur + 1] = true;  stack[sp++] = cur + 1; }
-                if (cj > 0      && mask[cur - gw] == 1 && !vis[cur - gw]) { vis[cur - gw] = true; stack[sp++] = cur - gw; }
-                if (cj < gh - 1 && mask[cur + gw] == 1 && !vis[cur + gw]) { vis[cur + gw] = true; stack[sp++] = cur + gw; }
-            }
-            {
-                Island isl = new Island();
-                isl.cx = c.minX + (sumI / cnt) * c.step + c.step / 2;
-                isl.cz = c.minZ + (sumJ / cnt) * c.step + c.step / 2;
-                isl.w = (i1 - i0 + 1) * c.step;
-                isl.h = (j1 - j0 + 1) * c.step;
-                isl.area = (long) cnt * c.step * c.step;
-                isl.dist = Math.hypot(isl.cx, isl.cz);
-                out.add(isl);
-            }
+        for (int k = 0; k < n; k++) {
+            if (hsFind(parent, k) != k) continue;
+            Island isl = new Island();
+            isl.cx = c.minX + (int) (sumI[k] / cntA[k]) * c.step + c.step / 2;
+            isl.cz = c.minZ + (int) (sumJ[k] / cntA[k]) * c.step + c.step / 2;
+            isl.w = (maxI[k] - minI[k] + 1) * c.step;
+            isl.h = (maxJ[k] - minJ[k] + 1) * c.step;
+            isl.area = (long) cntA[k] * c.step * c.step;
+            isl.dist = Math.hypot(isl.cx, isl.cz);
+            out.add(isl);
         }
         out.sort((a, b) -> Long.compare(b.area, a.area));
 
-        // ---- 细化: 对每个候选按更细步长 + 高度带重扫(数量过多时取面积最大的前5万个) ----
+        // ---- 阶段4: 细化(数量过多时取面积最大的前5万个) + 按真实面积筛选 ----
         int refineLimit = Math.min(out.size(), 50000);
         for (int i = 0; i < refineLimit; i++)
             refine(c, out.get(i));
 
-        // ---- 按细化后的真实面积筛选 ----
         List<Island> kept = new ArrayList<>();
         for (Island isl : out)
             if (isl.area >= c.minArea)
@@ -886,6 +905,35 @@ public class FindMushroomIslands {
         kept.sort((a, b) -> Long.compare(b.area, a.area));
         if (kept.size() > c.top) kept.subList(c.top, kept.size()).clear();
         return kept;
+    }
+
+    static int hsFind(int[] parent, int x) {
+        int r = x;
+        while (parent[r] != r) r = parent[r];
+        while (parent[x] != r) {
+            int nx = parent[x];
+            parent[x] = r;
+            x = nx;
+        }
+        return r;
+    }
+
+    static void hsUnion(int[] parent, int[] cnt, long[] sumI, long[] sumJ,
+            int[] minI, int[] maxI, int[] minJ, int[] maxJ, int a, Integer b) {
+        if (b == null) return;
+        int bb = b;
+        a = hsFind(parent, a);
+        bb = hsFind(parent, bb);
+        if (a == bb) return;
+        if (cnt[a] < cnt[bb]) { int t = a; a = bb; bb = t; }
+        parent[bb] = a;
+        cnt[a] += cnt[bb];
+        sumI[a] += sumI[bb];
+        sumJ[a] += sumJ[bb];
+        minI[a] = Math.min(minI[a], minI[bb]);
+        maxI[a] = Math.max(maxI[a], maxI[bb]);
+        minJ[a] = Math.min(minJ[a], minJ[bb]);
+        maxJ[a] = Math.max(maxJ[a], maxJ[bb]);
     }
 
     static void refine(Cfg c, Island isl) {
@@ -1009,13 +1057,14 @@ public class FindMushroomIslands {
             return 0;
         }
         Cfg c = new Cfg();
+        boolean stepSet = false;
         c.seedText = args[0];
         c.seed = parseSeed(args[0]);
         for (int i = 1; i < args.length; i++) {
             switch (args[i]) {
             case "-r":    c.maxX = c.maxZ = Integer.parseInt(args[++i]);
                           c.minX = c.minZ = -c.maxX; break;
-            case "-step": c.step = Integer.parseInt(args[++i]); break;
+            case "-step": c.step = Integer.parseInt(args[++i]); stepSet = true; break;
             case "-top":  c.top = Integer.parseInt(args[++i]); break;
             case "-min":  c.minArea = Long.parseLong(args[++i]); break;
             case "-y":    c.yq = Integer.parseInt(args[++i]); break;
@@ -1025,7 +1074,7 @@ public class FindMushroomIslands {
             }
         }
         if (c.ver < 0) { System.err.println("不支持的版本"); return 2; }
-        c.step = autoStep(c);
+        if (!stepSet) c.step = autoStep(c);
         System.out.printf("种子 %s (%d)  版本 %s  区域 [%d,%d]x[%d,%d]  步长 %d%n",
                 c.seedText, c.seed, VER_NAMES[c.ver],
                 c.minX, c.maxX, c.minZ, c.maxZ, c.step);
@@ -1052,7 +1101,7 @@ public class FindMushroomIslands {
     //==========================================================================
     //                              图形界面
     //==========================================================================
-    static final String VERSION = "1.2";
+    static final String VERSION = "1.3";
 
     static boolean LANG_EN = false;
 
