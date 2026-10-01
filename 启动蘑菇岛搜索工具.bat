@@ -7,5 +7,5 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-java FindMushroomIslands.java
+java --enable-native-access=ALL-UNNAMED -cp "libs\*" FindMushroomIslands.java
 if errorlevel 1 pause

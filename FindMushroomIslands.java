@@ -766,6 +766,7 @@ public class FindMushroomIslands {
         int yq = 16;         // 粗扫描 quart 高度 (y*4+2 ≈ 方块66)
         long minArea = 0;    // 最小岛面积(方块², 细化后判定)
         int top = 12;
+        boolean useGpu = false;
         int threads = Runtime.getRuntime().availableProcessors();
     }
 
@@ -791,8 +792,6 @@ public class FindMushroomIslands {
         step = (step + 3) / 4 * 4;
         return step;
     }
-
-    static final int[] REFINE_Y = {12, 14, 16, 18, 20, 22}; // quart, 方块48~90
 
     /** 扫描一个种子, 返回按面积降序的蘑菇岛列表(已细化)。被停止时返回 null。 */
     /** 扫描上下文: 保存命中块, 供界面在扫描过程中做实时预览。 */
@@ -822,6 +821,16 @@ public class FindMushroomIslands {
         int gw = (c.maxX - c.minX) / c.step;
         int gh = (c.maxZ - c.minZ) / c.step;
         if (ctx != null) { ctx.gw = gw; ctx.gh = gh; }
+        if (c.useGpu) {
+            prog.phase(t("GPU 采样中...", "GPU sampling..."));
+            long[] hits;
+            try {
+                hits = GpuScanner.scan(c, gw, gh);
+            } catch (Exception ex) {
+                throw new RuntimeException(t("GPU 扫描失败: ", "GPU scan failed: ") + ex, ex);
+            }
+            return finishScan(c, prog, hits);
+        }
         long total = (long) gw * gh;
         AtomicLong scanned = new AtomicLong();
         AtomicInteger rowCur = new AtomicInteger();
@@ -873,11 +882,13 @@ public class FindMushroomIslands {
         }
         if (stopped.get()) return null;
 
-        // ---- 阶段2+3: 并查集把相邻命中聚成候选岛 ----
-        List<Island> out = coarseIslands(snapshotChunks(ctx), c);
-        out.sort((a, b) -> Long.compare(b.area, a.area));
+        return finishScan(c, prog, snapshotChunks(ctx));
+    }
 
-        // ---- 阶段4: 细化(数量过多时取面积最大的前5万个) + 按真实面积筛选 ----
+    /** 聚类 + 细化 + 面积筛选 (CPU/GPU 共用)。 */
+    static List<Island> finishScan(Cfg c, Progress prog, long[] hits) {
+        List<Island> out = coarseIslands(hits, c);
+        out.sort((a, b) -> Long.compare(b.area, a.area));
         prog.phase(t("细化中...", "Refining..."));
         int refineLimit = Math.min(out.size(), 5000);
         long tLastRefine = 0;
@@ -889,7 +900,6 @@ public class FindMushroomIslands {
                 prog.refine(i + 1, refineLimit);
             }
         }
-
         List<Island> kept = new ArrayList<>();
         for (Island isl : out)
             if (isl.area >= c.minArea)
@@ -1014,19 +1024,16 @@ public class FindMushroomIslands {
         byte[] m2 = new byte[fw * fh];
         BiomeNoise bn = new BiomeNoise(c.ver);
         bn.setSeed(c.seed, c.large);
-        outer:
         for (int j = 0; j < fh; j++) {
             int z = bz0 + j * fs + fs / 2;
             int qz = z >> 2;
             for (int i = 0; i < fw; i++) {
                 int x = bx0 + i * fs + fs / 2;
                 int qx = x >> 2;
-                for (int yi = 0; yi < REFINE_Y.length; yi++) {
-                    if (sampleBiomeNoise(bn, null, qx, REFINE_Y[yi], qz) == B_MUSHROOM) {
-                        m2[j * fw + i] = 1;
-                        continue;
-                    }
-                }
+                // 单一地表高度采样 (与粗扫同 y): 蘑菇群系是 3D 的, 多高度任一命中
+                // 会把岛上方的高空空气柱也算进面积, 严重虚高
+                if (sampleBiomeNoise(bn, null, qx, c.yq, qz) == B_MUSHROOM)
+                    m2[j * fw + i] = 1;
             }
         }
         // 最大连通块
@@ -1134,6 +1141,7 @@ public class FindMushroomIslands {
             case "-y":    c.yq = Integer.parseInt(args[++i]); break;
             case "-mc":   c.ver = parseVer(args[++i]); break;
             case "-large": c.large = true; break;
+            case "-gpu":   c.useGpu = true; break;
             default: System.err.println("未知选项: " + args[i]); return 2;
             }
         }
@@ -1170,7 +1178,750 @@ public class FindMushroomIslands {
     //==========================================================================
     //                              图形界面
     //==========================================================================
-    static final String VERSION = "1.6";
+    //==========================================================================
+    //              GPU (OpenCL) 扫描后端 — 内核为本项目 Java 实现的移植
+    //==========================================================================
+    static final String GPU_KERNEL = """
+        // 蘑菇岛 GPU 采样内核 (OpenCL C) — 移植自已通过 cubiomes 黄金验证的 Java 实现
+        // ---------- 群系状态: 由主机端(Java, 已过黄金自检)序列化上传 ----------
+        typedef struct {
+            __global const uchar*  D;    // [nP*257] 置换表
+            __global const float*  A; __global const float* B; __global const float* C;
+            __global const float*  D2; __global const float* T2;
+            __global const float*  AMP; __global const float* LAC;
+            __global const int*    H2;
+            __global const int* OffA; __global const int* OffB;
+            __global const int* NA; __global const int* NB;
+            __global const float* CAMP;
+        } PState;
+
+        float indexed_lerp(int idx, float a, float b, float c) {
+            int k = idx & 0xf;
+            if (k == 0)  return a + b;
+            if (k == 1)  return -a + b;
+            if (k == 2)  return a - b;
+            if (k == 3)  return -a - b;
+            if (k == 4)  return a + c;
+            if (k == 5)  return -a + c;
+            if (k == 6)  return a - c;
+            if (k == 7)  return -a - c;
+            if (k == 8)  return b + c;
+            if (k == 9)  return -b + c;
+            if (k == 10) return b - c;
+            if (k == 11) return -b - c;
+            if (k == 12) return a + b;
+            if (k == 13) return -b + c;
+            if (k == 14) return -a + b;
+            return -b - c;
+        }
+
+        // 注意: 本核为 float 近似 (Intel 消费级 GPU 无 FP64); 振幅/累加仍为 double
+        float sample_perlin(const PState* ps, int p, float d1, float d2, float d3) {
+            int base = p * 257;
+            int h1, h2, h3;
+            float t1, t2, t3;
+            __global const uchar* idx = ps->D + base;
+            if (d2 == 0.0f) {
+                d2 = ps->D2[p]; h2 = ps->H2[p]; t2 = ps->T2[p];
+            } else {
+                d2 += ps->B[p];
+                float i2 = floor(d2);
+                d2 -= i2;
+                h2 = ((int)i2) & 0xFF;
+                t2 = d2*d2*d2 * (d2 * (d2*6.0f - 15.0f) + 10.0f);
+            }
+            d1 += ps->A[p];
+            d3 += ps->C[p];
+            float i1 = floor(d1), i3 = floor(d3);
+            d1 -= i1; d3 -= i3;
+            h1 = ((int)i1) & 0xFF;
+            h3 = ((int)i3) & 0xFF;
+            t1 = d1*d1*d1 * (d1 * (d1*6.0f - 15.0f) + 10.0f);
+            t3 = d3*d3*d3 * (d3 * (d3*6.0f - 15.0f) + 10.0f);
+            int a1 = (idx[h1]     + h2) & 0xFF;
+            int b1 = (idx[h1 + 1] + h2) & 0xFF;
+            int a2 = (idx[a1]     + h3) & 0xFF;
+            int b2 = (idx[b1]     + h3) & 0xFF;
+            int a3 = (idx[a1 + 1] + h3) & 0xFF;
+            int b3 = (idx[b1 + 1] + h3) & 0xFF;
+            float l1 = indexed_lerp(idx[a2],     d1,     d2,     d3);
+            float l2 = indexed_lerp(idx[b2],     d1 - 1, d2,     d3);
+            float l3 = indexed_lerp(idx[a3],     d1,     d2 - 1, d3);
+            float l4 = indexed_lerp(idx[b3],     d1 - 1, d2 - 1, d3);
+            float l5 = indexed_lerp(idx[a2 + 1], d1,     d2,     d3 - 1);
+            float l6 = indexed_lerp(idx[b2 + 1], d1 - 1, d2,     d3 - 1);
+            float l7 = indexed_lerp(idx[a3 + 1], d1,     d2 - 1, d3 - 1);
+            float l8 = indexed_lerp(idx[b3 + 1], d1 - 1, d2 - 1, d3 - 1);
+            l1 = l1 + t1 * (l2 - l1); l3 = l3 + t1 * (l4 - l3);
+            l5 = l5 + t1 * (l6 - l5); l7 = l7 + t1 * (l8 - l7);
+            l1 = l1 + t2 * (l3 - l1); l5 = l5 + t2 * (l7 - l5);
+            return l1 + t3 * (l5 - l1);
+        }
+
+        float sample_octave(const PState* ps, int off, int cnt, float x, float y, float z) {
+            float v = 0.0f;
+            for (int k = 0; k < cnt; k++) {
+                int p = off + k;
+                float lf = ps->LAC[p];
+                v += ps->AMP[p] * sample_perlin(ps, p, x * lf, y * lf, z * lf);
+            }
+            return v;
+        }
+
+        __constant float kDPF = 337.0f / 331.0f;
+
+        float sample_double_perlin(const PState* ps, int ch, float x, float y, float z) {
+            float v = sample_octave(ps, ps->OffA[ch], ps->NA[ch], x, y, z);
+            v += sample_octave(ps, ps->OffB[ch], ps->NB[ch], x * kDPF, y * kDPF, z * kDPF);
+            return v * ps->CAMP[ch];
+        }
+
+        // ---------- 气候通道编号 (与 Java 一致) ----------
+        // 0 温度 1 湿度 2 大陆性 3 侵蚀 4 偏移 5 奇异性
+
+        // ---------- 偏移样条 (主机展平上传) ----------
+        typedef struct {
+            __global const int*   Typ; __global const int*   Len;
+            __global const float* Val; __global const float* Loc;
+            __global const float* Der; __global const int*   Child;
+        } SplineBuf;
+
+        float spline_eval(int root, const float* vals, const SplineBuf* sp) {
+            // 递归转显式栈 (树深 <= 5)
+            int   fNode[8]; int fStage[8]; int fMode[8]; int fI[8];
+            float fF[8], fG[8], fH[8], fK[8], fL[8], fM[8], fN[8];
+            int spT = 1;
+            float res = 0.0f;
+            fNode[0] = root; fStage[0] = 0; fMode[0] = 0;
+            while (spT > 0) {
+                int top = spT - 1;
+                int node = fNode[top];
+                if (sp->Len[node] == 1) {
+                    res = sp->Val[node];
+                    spT--;
+                    if (spT > 0) fStage[spT-1]++;
+                    continue;
+                }
+                if (fStage[top] == 0) {
+                    float f = vals[sp->Typ[node]];
+                    int i = 0;
+                    for (i = 0; i < sp->Len[node]; i++)
+                        if (sp->Loc[node*12 + i] >= f) break;
+                    if (i == 0 || i == sp->Len[node]) {
+                        if (i != 0) i--;
+                        fI[top] = i; fF[top] = f; fMode[top] = 0; fStage[top] = 0;
+                        fNode[spT] = sp->Child[node*12 + i]; fStage[spT] = 0; spT++;
+                    } else {
+                        float g = sp->Loc[node*12 + i - 1], h = sp->Loc[node*12 + i];
+                        fF[top] = f; fI[top] = i; fG[top] = g; fH[top] = h;
+                        fK[top] = (f - g) / (h - g);
+                        fL[top] = sp->Der[node*12 + i - 1];
+                        fM[top] = sp->Der[node*12 + i];
+                        fMode[top] = 1; fStage[top] = 1;
+                        fNode[spT] = sp->Child[node*12 + i - 1]; fStage[spT] = 0; spT++;
+                    }
+                } else if (fStage[top] == 1) {
+                    float v = res;
+                    res = v + sp->Der[node*12 + fI[top]] * (fF[top] - sp->Loc[node*12 + fI[top]]);
+                    spT--;
+                    if (spT > 0) fStage[spT-1]++;
+                } else if (fStage[top] == 2) {
+                    fN[top] = res;
+                    fStage[top] = 3;
+                    fNode[spT] = sp->Child[node*12 + fI[top]]; fStage[spT] = 0; spT++;
+                } else {
+                    float n = fN[top], o = res;
+                    float p = fL[top] * (fH[top] - fG[top]) - (o - n);
+                    float q = -fM[top] * (fH[top] - fG[top]) + (o - n);
+                    float kf = fK[top] * (1.0f - fK[top]);
+                    res = (n + fK[top] * (o - n)) + kf * (p + fK[top] * (q - p));
+                    spT--;
+                    if (spT > 0) fStage[spT-1]++;
+                }
+            }
+            return res;
+        }
+
+        // ---------- 气候 -> 群系 btree (递归转显式栈) ----------
+        typedef struct {
+            __global const int*   Steps; __global const int*   Param;
+            __global const ulong* Nodes;
+            int Order; int Len;
+        } BTreeBuf;
+
+        long np_dist(const long* np, const BTreeBuf* bt, int idx) {
+            ulong node = bt->Nodes[idx];
+            ulong ds = 0;
+            for (int i = 0; i < 6; i++) {
+                int pi = (int)((node >> (8 * i)) & 0xFFUL);
+                long a = np[i] - (long)bt->Param[2 * pi + 1];
+                long b = (long)bt->Param[2 * pi] - np[i];
+                long d = a > 0 ? a : (b > 0 ? b : 0);
+                ds += (ulong)(d * d);
+            }
+            return (long)ds;
+        }
+
+                int btree_search(const long* np, const BTreeBuf* bt, __global long* trace);
+
+        int sample_biome(const PState* ps, const SplineBuf* sb, int root,
+                const BTreeBuf* bt, long* np, int x, int y, int z) {
+            float t, h, c, e, d, w;
+            float px = (float)x, pz = (float)z;
+            px += sample_double_perlin(ps, 4, x, 0, z) * 4.0f;
+            pz += sample_double_perlin(ps, 4, z, x, 0) * 4.0f;
+            c = sample_double_perlin(ps, 2, px, 0, pz);
+            e = sample_double_perlin(ps, 3, px, 0, pz);
+            w = sample_double_perlin(ps, 5, px, 0, pz);
+            {
+                float vals[4];
+                vals[0] = c; vals[1] = e;
+                vals[2] = -3.0f * (fabs(fabs(w) - 0.6666667f) - 0.33333334f);
+                vals[3] = w;
+                float off = spline_eval(root, vals, sb) + 0.015f;
+                d = 1.0f - (float)(y * 4) / 128.0f - 83.0f / 160.0f + off;
+            }
+            t = sample_double_perlin(ps, 0, px, 0, pz);
+            h = sample_double_perlin(ps, 1, px, 0, pz);
+            np[0] = (long)(10000.0f * t);
+            np[1] = (long)(10000.0f * h);
+            np[2] = (long)(10000.0f * c);
+            np[3] = (long)(10000.0f * e);
+            np[4] = (long)(10000.0f * d);
+            np[5] = (long)(10000.0f * w);
+            int idx = btree_search(np, bt, 0);
+            return (int)((bt->Nodes[idx] >> 48) & 0xFF);
+        }
+
+        __kernel void scan_mushroom(
+                int gw, int gh, int minX, int minZ, int step, int yq, int maxHits,
+                __global const uchar*  S_D,
+                __global const float* S_A, __global const float* S_B,
+                __global const float* S_C, __global const float* S_D2,
+                __global const float* S_T2, __global const float* S_AMP,
+                __global const float* S_LAC, __global const int* S_H2,
+                __global const int* C_OffA, __global const int* C_OffB,
+                __global const int* C_NA, __global const int* C_NB,
+                __global const float* C_AMP,
+                __global const int* SP_Typ, __global const int* SP_Len,
+                __global const float* SP_Val, __global const float* SP_Loc,
+                __global const float* SP_Der, __global const int* SP_Child,
+                int root,
+                __global const int* BT_Steps, __global const int* BT_Param,
+                __global const ulong* BT_Nodes, int BT_Order, int BT_Len,
+                __global int* outCnt, __global ulong* outHits) {
+            long gid = (long)get_global_id(0);
+            if (gid >= (long)gw * gh) return;
+            PState ps;
+            ps.D = S_D; ps.A = S_A; ps.B = S_B; ps.C = S_C;
+            ps.D2 = S_D2; ps.T2 = S_T2; ps.AMP = S_AMP; ps.LAC = S_LAC; ps.H2 = S_H2;
+            ps.OffA = C_OffA; ps.OffB = C_OffB; ps.NA = C_NA; ps.NB = C_NB; ps.CAMP = C_AMP;
+            SplineBuf sb;
+            sb.Typ = SP_Typ; sb.Len = SP_Len; sb.Val = SP_Val;
+            sb.Loc = SP_Loc; sb.Der = SP_Der; sb.Child = SP_Child;
+            BTreeBuf bt;
+            bt.Steps = BT_Steps; bt.Param = BT_Param; bt.Nodes = BT_Nodes;
+            bt.Order = BT_Order; bt.Len = BT_Len;
+            int i = (int)(gid % gw);
+            int j = (int)(gid / gw);
+            int x = minX + i * step + step / 2;
+            int z = minZ + j * step + step / 2;
+            long np[6];
+            int id = sample_biome(&ps, &sb, root, &bt, np, x >> 2, yq, z >> 2);
+            if (id == 14) {
+                uint slot = atom_inc(outCnt);
+                if ((long)slot < maxHits)
+                    outHits[slot] = ((ulong)i << 32) | ((ulong)j & 0xFFFFFFFFUL);
+            }
+        }
+
+        __kernel void debug_cell(
+                int gx, int gz, int yq,
+                __global const uchar*  S_D,
+                __global const float* S_A, __global const float* S_B,
+                __global const float* S_C, __global const float* S_D2,
+                __global const float* S_T2, __global const float* S_AMP,
+                __global const float* S_LAC, __global const int* S_H2,
+                __global const int* C_OffA, __global const int* C_OffB,
+                __global const int* C_NA, __global const int* C_NB,
+                __global const float* C_AMP,
+                __global const int* SP_Typ, __global const int* SP_Len,
+                __global const float* SP_Val, __global const float* SP_Loc,
+                __global const float* SP_Der, __global const int* SP_Child,
+                int root,
+                __global const int* BT_Steps, __global const int* BT_Param,
+                __global const ulong* BT_Nodes, int BT_Order, int BT_Len,
+                __global long* outNp, __global int* outId) {
+            PState ps;
+            ps.D = S_D; ps.A = S_A; ps.B = S_B; ps.C = S_C;
+            ps.D2 = S_D2; ps.T2 = S_T2; ps.AMP = S_AMP; ps.LAC = S_LAC; ps.H2 = S_H2;
+            ps.OffA = C_OffA; ps.OffB = C_OffB; ps.NA = C_NA; ps.NB = C_NB; ps.CAMP = C_AMP;
+            SplineBuf sb;
+            sb.Typ = SP_Typ; sb.Len = SP_Len; sb.Val = SP_Val;
+            sb.Loc = SP_Loc; sb.Der = SP_Der; sb.Child = SP_Child;
+            BTreeBuf bt;
+            bt.Steps = BT_Steps; bt.Param = BT_Param; bt.Nodes = BT_Nodes;
+            bt.Order = BT_Order; bt.Len = BT_Len;
+            long np[6];
+            int id = sample_biome(&ps, &sb, root, &bt, np, gx >> 2, yq, gz >> 2);
+            for (int k = 0; k < 6; k++) outNp[k] = np[k];
+            outId[0] = id;
+        }
+
+        int btree_search(const long* np, const BTreeBuf* bt, __global long* trace);
+
+        __kernel void debug_btree(
+                __global const long* inNp,
+                __global const int* BT_Steps, __global const int* BT_Param,
+                __global const ulong* BT_Nodes, int BT_Order, int BT_Len,
+                __global long* outRes, __global long* trace) {
+            BTreeBuf bt;
+            bt.Steps = BT_Steps; bt.Param = BT_Param; bt.Nodes = BT_Nodes;
+            bt.Order = BT_Order; bt.Len = BT_Len;
+            long np[6];
+            for (int k = 0; k < 6; k++) np[k] = inNp[k];
+            int idx = btree_search(np, &bt, trace);
+            outRes[0] = idx;
+            outRes[1] = (long)(((bt.Nodes[idx] >> 48)) & 0xFF);
+        }
+
+        int btree_search(const long* np, const BTreeBuf* bt, __global long* trace) {
+            int   fIdx[10]; int fAlt[10]; int fDepth[10]; int fStep[10];
+            int   fInner[10]; int fLeaf[10]; int fI[10]; int fStage[10];
+            long  fDs[10]; long fDsInner[10];
+            int spT = 1;
+            int res = 0;
+            int tN = 0;
+            fIdx[0] = 0; fAlt[0] = 0; fDs[0] = 0x7FFFFFFFFFFFFFFFL; fDepth[0] = 0; fStage[0] = 0;
+            while (spT > 0) {
+                int top = spT - 1;
+                if (fStage[top] == 0) {
+                    if (trace != 0 && tN < 60) trace[tN++] = ((long)fDepth[top] << 32) | (long)fIdx[top];
+                    if (bt->Steps[fDepth[top]] == 0) {
+                        res = fIdx[top];
+                        spT--;
+                        if (spT > 0) fStage[spT-1] = 2;
+                        continue;
+                    }
+                    int step;
+                    do {
+                        step = bt->Steps[fDepth[top]];
+                        fDepth[top]++;
+                    } while (fIdx[top] + step >= bt->Len);
+                    fStep[top] = step;
+                    fInner[top] = (int)((bt->Nodes[fIdx[top]] >> 48) & 0xFFFFUL);
+                    fLeaf[top] = fAlt[top];
+                    fI[top] = 0;
+                    fStage[top] = 1;
+                } else if (fStage[top] == 1) {
+                    if (fI[top] >= bt->Order) {
+                        res = fLeaf[top];
+                        spT--;
+                        if (spT > 0) fStage[spT-1] = 2;
+                        continue;
+                    }
+                    long dsInner = np_dist(np, bt, fInner[top]);
+                    if (dsInner < fDs[top]) {
+                        fDsInner[top] = dsInner;
+                        fIdx[spT] = fInner[top]; fAlt[spT] = fLeaf[top];
+                        fDs[spT] = fDs[top]; fDepth[spT] = fDepth[top];
+                        fStage[spT] = 0;
+                        fStage[top] = 2;
+                        spT++;
+                    } else {
+                        fStage[top] = 3;
+                    }
+                } else if (fStage[top] == 2) {
+                    int leaf2 = res;
+                    long dsLeaf2 = (fInner[top] == leaf2) ? fDsInner[top] : np_dist(np, bt, leaf2);
+                    if (dsLeaf2 < fDs[top]) {
+                        fDs[top] = dsLeaf2;
+                        fLeaf[top] = leaf2;
+                    }
+                    fStage[top] = 3;
+                } else {
+                    fInner[top] += fStep[top];
+                    if (fInner[top] >= bt->Len) {
+                        res = fLeaf[top];
+                        spT--;
+                        if (spT > 0) fStage[spT-1] = 2;
+                    } else {
+                        fI[top]++;
+                        fStage[top] = 1;
+                    }
+                }
+            }
+            if (trace != 0 && tN < 60) trace[tN++] = -1L;
+            return res;
+        }
+    """;
+
+    static final class GpuScanner {
+        static boolean probeDone = false;
+        static boolean available = false;
+        static String unavailableReason = "";
+        static org.jocl.cl_context ctx;
+        static org.jocl.cl_command_queue queue;
+        static org.jocl.cl_device_id dev;
+        static org.jocl.cl_program progRef;
+        static org.jocl.cl_kernel kernel;
+        static org.jocl.cl_kernel debugKernel;
+        static boolean stateAllocated = false;
+        static int curMaxHits = -1;
+        static org.jocl.cl_mem memD, memA, memB, memC, memD2, memT2, memH2,
+                memPAMP, memPLAC, memCAMP, memOffA, memOffB, memNA, memNB,
+                memSPTyp, memSPLen, memSPVal, memSPLoc, memSPDer, memSPChild,
+                memBTSteps, memBTParam, memBTNodes, memOutCnt, memOutHits;
+
+        static synchronized boolean available() {
+            if (!probeDone) {
+                probeDone = true;
+                try {
+                    initOpenCl();
+                    available = true;
+                } catch (Throwable ex) {
+                    unavailableReason = String.valueOf(ex);
+                    available = false;
+                }
+            }
+            return available;
+        }
+
+        static void checkErr(int err, String what) throws Exception {
+            if (err != org.jocl.CL.CL_SUCCESS)
+                throw new Exception(what + " 失败: " + err);
+        }
+
+        static void initOpenCl() throws Exception {
+            int[] n = new int[1];
+            checkErr(org.jocl.CL.clGetPlatformIDs(0, null, n), "枚举 OpenCL 平台");
+            if (n[0] == 0) throw new Exception("没有 OpenCL 平台");
+            org.jocl.cl_platform_id[] ps = new org.jocl.cl_platform_id[n[0]];
+            org.jocl.CL.clGetPlatformIDs(n[0], ps, null);
+            org.jocl.cl_device_id gpu = null, any = null;
+            org.jocl.cl_platform_id gpuPlat = null, anyPlat = null;
+            for (org.jocl.cl_platform_id p : ps) {
+                int[] dn = new int[1];
+                if (org.jocl.CL.clGetDeviceIDs(p, org.jocl.CL.CL_DEVICE_TYPE_ALL,
+                        0, null, dn) != org.jocl.CL.CL_SUCCESS) continue;
+                org.jocl.cl_device_id[] ds = new org.jocl.cl_device_id[dn[0]];
+                org.jocl.CL.clGetDeviceIDs(p, org.jocl.CL.CL_DEVICE_TYPE_ALL, dn[0], ds, null);
+                for (org.jocl.cl_device_id d : ds) {
+                    long[] type = new long[1];
+                    org.jocl.CL.clGetDeviceInfo(d, org.jocl.CL.CL_DEVICE_TYPE, 8,
+                            org.jocl.Pointer.to(type), null);
+                    if ((type[0] & org.jocl.CL.CL_DEVICE_TYPE_GPU) != 0 && gpu == null) {
+                        gpu = d; gpuPlat = p;
+                    }
+                    if (any == null) { any = d; anyPlat = p; }
+                }
+            }
+            dev = gpu != null ? gpu : any;
+            org.jocl.cl_platform_id plat = gpu != null ? gpuPlat : anyPlat;
+            if (dev == null) throw new Exception("没有可用的 OpenCL 设备");
+            org.jocl.cl_context_properties props = new org.jocl.cl_context_properties();
+            props.addProperty(org.jocl.CL.CL_CONTEXT_PLATFORM, plat);
+            ctx = org.jocl.CL.clCreateContext(props, 1, new org.jocl.cl_device_id[]{dev},
+                    null, null, new int[1]);
+            queue = org.jocl.CL.clCreateCommandQueueWithProperties(ctx, dev, null, null);
+            org.jocl.cl_program prog = org.jocl.CL.clCreateProgramWithSource(ctx, 1,
+                    new String[]{ GPU_KERNEL }, null, null);
+            int err = org.jocl.CL.clBuildProgram(prog, 1, new org.jocl.cl_device_id[]{dev},
+                    "", null, null);
+            if (err != org.jocl.CL.CL_SUCCESS) {
+                long[] len = new long[1];
+                org.jocl.CL.clGetProgramBuildInfo(prog, dev,
+                        org.jocl.CL.CL_PROGRAM_BUILD_LOG, 0, null, len);
+                byte[] log = new byte[(int) len[0]];
+                org.jocl.CL.clGetProgramBuildInfo(prog, dev,
+                        org.jocl.CL.CL_PROGRAM_BUILD_LOG, log.length,
+                        org.jocl.Pointer.to(log), null);
+                throw new Exception("内核编译失败: " + new String(log));
+            }
+            progRef = prog;
+            kernel = org.jocl.CL.clCreateKernel(prog, "scan_mushroom", null);
+            debugKernel = org.jocl.CL.clCreateKernel(prog, "debug_cell", null);
+        }
+
+        /** GPU 扫描: 返回 packed (i<<32|j) 命中数组 (与 CPU 流式扫描同格式)。 */
+        static synchronized long[] scan(Cfg c, int gw, int gh) throws Exception {
+            available();
+            if (!available) throw new Exception("OpenCL 不可用: " + unavailableReason);
+
+            // ---- 主机侧初始化种子状态 (与 Java setBiomeSeed 完全一致), 序列化 ----
+            BiomeNoise bn = new BiomeNoise(c.ver);
+            bn.setSeed(c.seed, c.large);
+            int nP = 0;
+            int[] offA = new int[6], offB = new int[6], nA = new int[6], nB = new int[6];
+            float[] camp = new float[6];
+            java.util.List<Perlin> perlins = new ArrayList<>();
+            for (int ch = 0; ch < 6; ch++) {
+                DoublePerlin dp = bn.climate[ch];
+                offA[ch] = nP;
+                for (int k = 0; k < dp.octA.n; k++) perlins.add(dp.octA.p[k]);
+                nP += dp.octA.n; nA[ch] = dp.octA.n;
+                offB[ch] = nP;
+                for (int k = 0; k < dp.octB.n; k++) perlins.add(dp.octB.p[k]);
+                nP += dp.octB.n; nB[ch] = dp.octB.n;
+                camp[ch] = (float) dp.amplitude;
+            }
+            byte[] sD = new byte[nP * 257];
+            float[] sA = new float[nP], sB = new float[nP], sC = new float[nP];
+            float[] sD2 = new float[nP], sT2 = new float[nP];
+            float[] sAMP = new float[nP], sLAC = new float[nP];
+            int[] sH2 = new int[nP];
+            for (int p = 0; p < nP; p++) {
+                Perlin pl = perlins.get(p);
+                for (int k = 0; k < 257; k++) sD[p * 257 + k] = (byte) pl.d[k];
+                sA[p] = (float) pl.a; sB[p] = (float) pl.b; sC[p] = (float) pl.c;
+                sD2[p] = (float) pl.d2; sT2[p] = (float) pl.t2;
+                sAMP[p] = (float) pl.amplitude; sLAC[p] = (float) pl.lacunarity;
+                sH2[p] = pl.h2;
+            }
+
+            // ---- 样条展平 ----
+            java.util.List<Spline> spList = new ArrayList<>();
+            java.util.IdentityHashMap<Spline, Integer> seen = new java.util.IdentityHashMap<>();
+            flattenSpline(bn.root, spList, seen);
+            int nn = spList.size();
+            int[] spTyp = new int[nn], spLen = new int[nn], spChild = new int[nn * 12];
+            float[] spVal = new float[nn], spLoc = new float[nn * 12], spDer = new float[nn * 12];
+            for (int i = 0; i < nn; i++) {
+                Spline s = spList.get(i);
+                spTyp[i] = s.typ; spLen[i] = s.len; spVal[i] = s.val;
+                for (int k = 0; k < 12; k++) {
+                    spLoc[i * 12 + k] = s.loc[k];
+                    spDer[i * 12 + k] = s.der[k];
+                    spChild[i * 12 + k] = (s.len == 1 || k >= s.len || s.valArr[k] == null)
+                            ? -1 : seen.get(s.valArr[k]);
+                }
+            }
+
+            BTree bt = BTREE[c.ver];
+
+            // ---- 上传/分配 ----
+            if (!stateAllocated) {
+                allocBuffers(nP, nn, bt);
+                stateAllocated = true;
+            }
+            upload(memD, sD); upload(memA, sA); upload(memB, sB); upload(memC, sC);
+            upload(memD2, sD2); upload(memT2, sT2); upload(memH2, sH2);
+            upload(memPAMP, sAMP); upload(memPLAC, sLAC); upload(memCAMP, camp);
+            upload(memOffA, offA); upload(memOffB, offB); upload(memNA, nA); upload(memNB, nB);
+            upload(memSPTyp, spTyp); upload(memSPLen, spLen); upload(memSPVal, spVal);
+            upload(memSPLoc, spLoc); upload(memSPDer, spDer); upload(memSPChild, spChild);
+            upload(memBTSteps, bt.steps); upload(memBTParam, bt.param); upload(memBTNodes, bt.nodes);
+
+            int maxHits = (int) Math.min(2_000_000L, (long) gw * gh);
+            if (maxHits > curMaxHits) {
+                if (memOutCnt != null) org.jocl.CL.clReleaseMemObject(memOutCnt);
+                if (memOutHits != null) org.jocl.CL.clReleaseMemObject(memOutHits);
+                memOutCnt = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_WRITE, 4, null, null);
+                memOutHits = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_WRITE_ONLY,
+                        (long) maxHits * 8, null, null);
+                curMaxHits = maxHits;
+            }
+            org.jocl.CL.clEnqueueFillBuffer(queue, memOutCnt, org.jocl.Pointer.to(new int[]{0}),
+                    org.jocl.Sizeof.cl_int, 0, 4, 0, null, null);
+
+            // ---- 参数 ----
+            int a = 0;
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{gw}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{gh}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{c.minX}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{c.minZ}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{c.step}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{c.yq}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{maxHits}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memD}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memA}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memB}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memC}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memD2}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memT2}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memPAMP}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memPLAC}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memH2}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memOffA}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memOffB}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memNA}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memNB}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memCAMP}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memSPTyp}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memSPLen}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memSPVal}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memSPLoc}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memSPDer}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memSPChild}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{0}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memBTSteps}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memBTParam}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memBTNodes}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{bt.order}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{bt.len}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memOutCnt}));
+            org.jocl.CL.clSetKernelArg(kernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memOutHits}));
+
+            long global = ((long) gw * gh + 255L) / 256L * 256L;
+            int err = org.jocl.CL.clEnqueueNDRangeKernel(queue, kernel, 1, null,
+                    new long[]{ global }, new long[]{ 256 }, 0, null, null);
+            checkErr(err, "GPU 启动");
+            org.jocl.CL.clFinish(queue);
+
+            int[] cnt = new int[1];
+            org.jocl.CL.clEnqueueReadBuffer(queue, memOutCnt, org.jocl.CL.CL_TRUE, 0, 4,
+                    org.jocl.Pointer.to(cnt), 0, null, null);
+            int got = Math.min(cnt[0], maxHits);
+            long[] hits = new long[got];
+            if (got > 0)
+                org.jocl.CL.clEnqueueReadBuffer(queue, memOutHits, org.jocl.CL.CL_TRUE, 0,
+                        (long) got * 8, org.jocl.Pointer.to(hits), 0, null, null);
+            return hits;
+        }
+
+        static org.jocl.cl_mem memOutNp, memOutId, memBtIn, memBtOut, memBtTrace;
+        static org.jocl.cl_kernel debugBtreeKernel;
+        static boolean btreeKernelReady = false;
+
+        /** 调试: 直接用 np 跑内核 btree, 返回 {Long idx, Long biome}。 */
+        static synchronized Object[] debugBtree(long[] np, int ver) throws Exception {
+            available();
+            if (!available) throw new Exception("OpenCL 不可用");
+            if (!btreeKernelReady) {
+                debugBtreeKernel = org.jocl.CL.clCreateKernel(progRef, "debug_btree", null);
+                memBtIn = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, 48, null, null);
+                memBtOut = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_WRITE, 128, null, null);
+                memBtTrace = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_WRITE, 64 * 8L, null, null);
+                btreeKernelReady = true;
+            }
+            BTree bt = BTREE[ver];
+            org.jocl.CL.clEnqueueWriteBuffer(queue, memBtIn, org.jocl.CL.CL_TRUE, 0, 48,
+                    org.jocl.Pointer.to(np), 0, null, null);
+            int a = 0;
+            org.jocl.CL.clSetKernelArg(debugBtreeKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memBtIn}));
+            org.jocl.CL.clSetKernelArg(debugBtreeKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memBTSteps}));
+            org.jocl.CL.clSetKernelArg(debugBtreeKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memBTParam}));
+            org.jocl.CL.clSetKernelArg(debugBtreeKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memBTNodes}));
+            org.jocl.CL.clSetKernelArg(debugBtreeKernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{bt.order}));
+            org.jocl.CL.clSetKernelArg(debugBtreeKernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{bt.len}));
+            org.jocl.CL.clSetKernelArg(debugBtreeKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memBtOut}));
+            org.jocl.CL.clSetKernelArg(debugBtreeKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memBtTrace}));
+            org.jocl.CL.clEnqueueNDRangeKernel(queue, debugBtreeKernel, 1, null, new long[]{1}, new long[]{1}, 0, null, null);
+            org.jocl.CL.clFinish(queue);
+            long[] out = new long[16];
+            org.jocl.CL.clEnqueueReadBuffer(queue, memBtOut, org.jocl.CL.CL_TRUE, 0, 128,
+                    org.jocl.Pointer.to(out), 0, null, null);
+            long[] tr = new long[64];
+            org.jocl.CL.clEnqueueReadBuffer(queue, memBtTrace, org.jocl.CL.CL_TRUE, 0, 64 * 8L,
+                    org.jocl.Pointer.to(tr), 0, null, null);
+            return new Object[]{ out[0], out[1], tr, out };
+        }
+
+        /** 调试: 在上次 scan 的种子状态下采样单个世界坐标, 返回 {long[6] np, Integer id}。 */
+        static synchronized Object[] debugSample(int x, int z, int yq, int ver) throws Exception {
+            available();
+            if (!available) throw new Exception("OpenCL 不可用");
+            BTree bt = BTREE[ver];
+            upload(memBTSteps, bt.steps); upload(memBTParam, bt.param); upload(memBTNodes, bt.nodes);
+            long[] outNp = new long[6];
+            int[] outId = new int[1];
+            int a = 0;
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{x}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{z}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{yq}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memD}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memA}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memB}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memC}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memD2}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memT2}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memPAMP}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memPLAC}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memH2}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memOffA}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memOffB}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memNA}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memNB}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memCAMP}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memSPTyp}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memSPLen}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memSPVal}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memSPLoc}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memSPDer}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memSPChild}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{0}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memBTSteps}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memBTParam}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memBTNodes}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{bt.order}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_int, org.jocl.Pointer.to(new int[]{bt.len}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memOutNp}));
+            org.jocl.CL.clSetKernelArg(debugKernel, a++, org.jocl.Sizeof.cl_mem, org.jocl.Pointer.to(new org.jocl.cl_mem[]{memOutId}));
+            org.jocl.CL.clEnqueueNDRangeKernel(queue, debugKernel, 1, null,
+                    new long[]{1}, new long[]{1}, 0, null, null);
+            org.jocl.CL.clFinish(queue);
+            org.jocl.CL.clEnqueueReadBuffer(queue, memOutNp, org.jocl.CL.CL_TRUE, 0, 48,
+                    org.jocl.Pointer.to(outNp), 0, null, null);
+            org.jocl.CL.clEnqueueReadBuffer(queue, memOutId, org.jocl.CL.CL_TRUE, 0, 4,
+                    org.jocl.Pointer.to(outId), 0, null, null);
+            return new Object[]{ outNp, outId[0] };
+        }
+
+        static void upload(org.jocl.cl_mem mem, Object arr) {
+            long size;
+            org.jocl.Pointer ptr;
+            if (arr instanceof byte[] a) { size = a.length; ptr = org.jocl.Pointer.to(a); }
+            else if (arr instanceof int[] a) { size = (long) a.length * 4; ptr = org.jocl.Pointer.to(a); }
+            else if (arr instanceof double[] a) { size = (long) a.length * 8; ptr = org.jocl.Pointer.to(a); }
+            else if (arr instanceof long[] a) { size = (long) a.length * 8; ptr = org.jocl.Pointer.to(a); }
+            else if (arr instanceof float[] a) { size = (long) a.length * 4; ptr = org.jocl.Pointer.to(a); }
+            else throw new IllegalArgumentException();
+            org.jocl.CL.clEnqueueWriteBuffer(queue, mem, org.jocl.CL.CL_TRUE, 0, size, ptr, 0, null, null);
+        }
+
+        static void allocBuffers(int nP, int nn, BTree bt) throws Exception {
+            memD = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, (long) nP * 257, null, null);
+            memA = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, (long) nP * 4, null, null);
+            memB = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, (long) nP * 4, null, null);
+            memC = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, (long) nP * 4, null, null);
+            memD2 = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, (long) nP * 4, null, null);
+            memT2 = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, (long) nP * 4, null, null);
+            memH2 = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, (long) nP * 4, null, null);
+            memPAMP = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, (long) nP * 4, null, null);
+            memPLAC = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, (long) nP * 4, null, null);
+            memCAMP = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, 6 * 4L, null, null);
+            memOffA = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, 6 * 4L, null, null);
+            memOffB = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, 6 * 4L, null, null);
+            memNA = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, 6 * 4L, null, null);
+            memNB = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, 6 * 4L, null, null);
+            memSPTyp = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, (long) nn * 4, null, null);
+            memSPLen = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, (long) nn * 4, null, null);
+            memSPVal = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, (long) nn * 4, null, null);
+            memSPLoc = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, (long) nn * 12 * 4, null, null);
+            memSPDer = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, (long) nn * 12 * 4, null, null);
+            memSPChild = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY, (long) nn * 12 * 4, null, null);
+            memBTSteps = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY,
+                    (long) bt.steps.length * 4, null, null);
+            memBTParam = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY,
+                    (long) bt.param.length * 4, null, null);
+            memBTNodes = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_ONLY,
+                    (long) bt.nodes.length * 8, null, null);
+            memOutNp = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_WRITE, 48, null, null);
+            memOutId = org.jocl.CL.clCreateBuffer(ctx, org.jocl.CL.CL_MEM_READ_WRITE, 4, null, null);
+        }
+
+        static void flattenSpline(Spline s, java.util.List<Spline> out,
+                java.util.IdentityHashMap<Spline, Integer> seen) {
+            if (seen.containsKey(s)) return;
+            seen.put(s, out.size());
+            out.add(s);
+            if (s.len > 1)
+                for (int k = 0; k < s.len; k++)
+                    flattenSpline(s.valArr[k], out, seen);
+        }
+    }
+
+    static final String VERSION = "2.1";
 
     static boolean LANG_EN = false;
 
@@ -1192,7 +1943,7 @@ public class FindMushroomIslands {
     static class FormRefs {
         final boolean listMode;
         JTextField seedField, threadsField, minXf, maxXf, minZf, maxZf, sideField, listFileField;
-        JComboBox<String> filterBox, verBox, worldBox, langBox, resBox;
+        JComboBox<String> filterBox, verBox, worldBox, langBox, resBox, deviceBox;
         JCheckBox sideCheck;
         JButton startBtn, pauseBtn, stopBtn, resetBtn, exportBtn, sortBtn, browseBtn, selfTestBtn;
         JProgressBar bar;
@@ -1256,6 +2007,16 @@ public class FindMushroomIslands {
             form.add(f.threadsField, g);
             g.gridx = 2; g.fill = java.awt.GridBagConstraints.NONE;
             form.add(new JLabel(""), g);
+            row++;
+
+            g.gridx = 0; g.gridy = row;
+            form.add(new JLabel(t("计算设备:", "Device:")), g);
+            g.gridx = 1; g.fill = java.awt.GridBagConstraints.HORIZONTAL;
+            f.deviceBox = new JComboBox<>(new String[] {
+                    t("CPU", "CPU"), t("GPU (OpenCL)", "GPU (OpenCL)") });
+            form.add(f.deviceBox, g);
+            g.gridx = 2; g.fill = java.awt.GridBagConstraints.NONE;
+            form.add(new JLabel(t("(无 OpenCL 时不可选)", "(needs OpenCL)")), g);
             row++;
 
             g.gridx = 0; g.gridy = row;
@@ -1505,6 +2266,9 @@ public class FindMushroomIslands {
             c.minZ = Math.max(-LIMIT, c.minZ); c.maxZ = Math.min(LIMIT, c.maxZ);
             int th = Integer.parseInt(f.threadsField.getText().trim());
             c.threads = Math.max(1, Math.min(512, th));
+            c.useGpu = f.deviceBox.getSelectedIndex() == 1;
+            if (c.useGpu && !GpuScanner.available())
+                throw new Exception(t("OpenCL 不可用: ", "OpenCL unavailable: ") + GpuScanner.unavailableReason);
             c.minArea = new long[] {0, 16384, 65536, 262144, 1048576}[f.filterBox.getSelectedIndex()];
             int resIdx = f.resBox.getSelectedIndex();
             c.step = resIdx == 0 ? autoStep(c)
@@ -1517,7 +2281,7 @@ public class FindMushroomIslands {
             c.ver = o.ver; c.large = o.large;
             c.minX = o.minX; c.maxX = o.maxX; c.minZ = o.minZ; c.maxZ = o.maxZ;
             c.step = o.step; c.yq = o.yq; c.minArea = o.minArea;
-            c.top = o.top; c.threads = o.threads;
+            c.top = o.top; c.threads = o.threads; c.useGpu = o.useGpu;
             return c;
         }
 
