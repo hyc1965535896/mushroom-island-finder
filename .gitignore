@@ -1,0 +1,9 @@
+# cubiomes 参考源码（第三方，出处见 README/LICENSE）
+_ref/
+
+# 调试产物
+*.log
+ref_ids_*.txt
+java_ids_*.txt
+__pycache__/
+*.class
