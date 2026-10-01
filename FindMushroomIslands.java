@@ -778,6 +778,7 @@ public class FindMushroomIslands {
     interface Progress {
         void update(long scanned, long total);
         void phase(String s);
+        void refine(int done, int total);
         /** 返回 false 表示要求停止 */
         boolean running();
     }
@@ -877,8 +878,15 @@ public class FindMushroomIslands {
         // ---- 阶段4: 细化(数量过多时取面积最大的前5万个) + 按真实面积筛选 ----
         prog.phase(t("细化中...", "Refining..."));
         int refineLimit = Math.min(out.size(), 50000);
-        for (int i = 0; i < refineLimit; i++)
+        long tLastRefine = 0;
+        for (int i = 0; i < refineLimit; i++) {
             refine(c, out.get(i));
+            long now = System.currentTimeMillis();
+            if (now - tLastRefine > 100 || i == refineLimit - 1) {
+                tLastRefine = now;
+                prog.refine(i + 1, refineLimit);
+            }
+        }
 
         List<Island> kept = new ArrayList<>();
         for (Island isl : out)
@@ -1136,6 +1144,10 @@ public class FindMushroomIslands {
         List<Island> list = scanSeed(c, new Progress() {
             public void update(long s, long total) {}
             public void phase(String s) {}
+            public void refine(int done, int total) {
+                System.out.printf("\r细化 %d/%d (%.0f%%)", done, total, 100.0 * done / total);
+                if (done == total) System.out.println();
+            }
             public boolean running() { return true; }
         }, new ScanCtx());
         double secs = (System.nanoTime() - t0) / 1e9;
@@ -1156,7 +1168,7 @@ public class FindMushroomIslands {
     //==========================================================================
     //                              图形界面
     //==========================================================================
-    static final String VERSION = "1.4";
+    static final String VERSION = "1.5";
 
     static boolean LANG_EN = false;
 
@@ -1592,6 +1604,16 @@ public class FindMushroomIslands {
             public void update(long s, long total) { lastS = s; lastTotal = total; }
             public void phase(String s) {
                 SwingUtilities.invokeLater(() -> f.progressLabel.setText(s));
+            }
+            public void refine(int done, int total) {
+                final double frac = total > 0 ? (double) done / total : 0;
+                SwingUtilities.invokeLater(() -> {
+                    f.bar.setValue((int) Math.round(frac * 10000));
+                    f.progressLabel.setText(String.format(
+                            t("细化: %d/%d (%.1f%%)", "Refining: %d/%d (%.1f%%)"),
+                            done, total, frac * 100));
+                    f.remainLabel.setText(t("剩余时间: --", "Remaining: --"));
+                });
             }
             public void finish() { done = true; }
             public boolean running() {
