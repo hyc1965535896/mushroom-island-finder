@@ -1,5 +1,5 @@
 /*
- * Minecraft Java版 蘑菇岛搜索工具 1.0
+ * Minecraft Java版 蘑菇岛搜索工具 1.1
  * 作者: HYChyc114514
  *
  * 核心算法移植自 cubiomes (MIT License, Copyright (c) 2021 Cubitect)
@@ -1045,6 +1045,8 @@ public class FindMushroomIslands {
     //==========================================================================
     //                              图形界面
     //==========================================================================
+    static final String VERSION = "1.1";
+
     static boolean LANG_EN = false;
 
     static String t(String zh, String en) { return LANG_EN ? en : zh; }
@@ -1061,16 +1063,21 @@ public class FindMushroomIslands {
         SwingUtilities.invokeLater(() -> new GuiFrame().setVisible(true));
     }
 
-    static class GuiFrame extends JFrame {
-        JTextField seedField, threadsField;
+    /** 每个标签页一套组件引用，避免互相覆盖（v1.1 修复"请输入种子"误报）。 */
+    static class FormRefs {
+        final boolean listMode;
+        JTextField seedField, threadsField, minXf, maxXf, minZf, maxZf, sideField, listFileField;
         JComboBox<String> filterBox, verBox, worldBox, langBox;
-        JTextField minXf, maxXf, minZf, maxZf, sideField, listFileField;
         JCheckBox sideCheck;
-        JButton startBtn, pauseBtn, stopBtn, resetBtn, exportBtn, sortBtn,
-                browseBtn, selfTestBtn;
+        JButton startBtn, pauseBtn, stopBtn, resetBtn, exportBtn, sortBtn, browseBtn, selfTestBtn;
         JProgressBar bar;
         JLabel progressLabel, elapsedLabel, remainLabel;
         JTextArea output;
+        FormRefs(boolean listMode) { this.listMode = listMode; }
+    }
+
+    static class GuiFrame extends JFrame {
+        FormRefs fSeed, fList;
         Thread searchThread;
         volatile boolean pauseFlag, stopFlag;
         List<Island> lastIslands = new ArrayList<>();
@@ -1083,12 +1090,14 @@ public class FindMushroomIslands {
         }
 
         void buildUi() {
-            setTitle(t("Minecraft Java版蘑菇岛搜索工具 1.0",
-                       "Minecraft Java Mushroom Island Finder 1.0"));
+            setTitle(t("Minecraft Java版蘑菇岛搜索工具 " + VERSION,
+                       "Minecraft Java Mushroom Island Finder " + VERSION));
             getContentPane().removeAll();
             JTabbedPane tabs = new JTabbedPane();
-            tabs.addTab(t("单种子搜索", "Single seed"), buildForm(false));
-            tabs.addTab(t("从种子列表搜索", "Seed list"), buildForm(true));
+            fSeed = new FormRefs(false);
+            tabs.addTab(t("单种子搜索", "Single seed"), buildForm(fSeed));
+            fList = new FormRefs(true);
+            tabs.addTab(t("从种子列表搜索", "Seed list"), buildForm(fList));
             add(tabs);
             pack();
             setSize(1180, 760);
@@ -1096,7 +1105,7 @@ public class FindMushroomIslands {
             repaint();
         }
 
-        JPanel buildForm(boolean listMode) {
+        JPanel buildForm(FormRefs f) {
             JPanel p = new JPanel(new java.awt.BorderLayout(8, 8));
 
             JPanel form = new JPanel(new java.awt.GridBagLayout());
@@ -1108,8 +1117,8 @@ public class FindMushroomIslands {
             g.gridx = 0; g.gridy = row; g.weightx = 0;
             form.add(new JLabel(t("种子:", "Seed:")), g);
             g.gridx = 1; g.weightx = 1; g.fill = java.awt.GridBagConstraints.HORIZONTAL;
-            seedField = new JTextField();
-            form.add(seedField, g);
+            f.seedField = new JTextField();
+            form.add(f.seedField, g);
             g.gridx = 2; g.weightx = 0; g.fill = java.awt.GridBagConstraints.NONE;
             form.add(new JLabel(""), g);
             row++;
@@ -1117,9 +1126,9 @@ public class FindMushroomIslands {
             g.gridx = 0; g.gridy = row;
             form.add(new JLabel(t("线程数:", "Threads:")), g);
             g.gridx = 1; g.fill = java.awt.GridBagConstraints.HORIZONTAL;
-            threadsField = new JTextField(String.valueOf(
+            f.threadsField = new JTextField(String.valueOf(
                     Runtime.getRuntime().availableProcessors()));
-            form.add(threadsField, g);
+            form.add(f.threadsField, g);
             g.gridx = 2; g.fill = java.awt.GridBagConstraints.NONE;
             form.add(new JLabel(""), g);
             row++;
@@ -1128,13 +1137,13 @@ public class FindMushroomIslands {
             form.add(new JLabel(t("筛选蘑菇岛最小面积(越大搜索越快):",
                     "Min island area (bigger = faster):")), g);
             g.gridx = 1; g.fill = java.awt.GridBagConstraints.HORIZONTAL;
-            filterBox = new JComboBox<>(new String[] {
+            f.filterBox = new JComboBox<>(new String[] {
                     t("不限", "No limit"),
                     ">= 128 x 128",
                     ">= 256 x 256",
                     ">= 512 x 512",
                     ">= 1024 x 1024" });
-            form.add(filterBox, g);
+            form.add(f.filterBox, g);
             g.gridx = 2; g.fill = java.awt.GridBagConstraints.NONE;
             form.add(new JLabel(""), g);
             row++;
@@ -1142,11 +1151,11 @@ public class FindMushroomIslands {
             g.gridx = 0; g.gridy = row;
             form.add(new JLabel(t("版本:", "Version:")), g);
             g.gridx = 1; g.fill = java.awt.GridBagConstraints.HORIZONTAL;
-            verBox = new JComboBox<>(new String[] {
+            f.verBox = new JComboBox<>(new String[] {
                     "1.18 ~ 1.19.1", "1.19.2 ~ 1.19.3", "1.19.4 ~ 1.20.5",
                     "1.20.6 ~ 1.21.3", "1.21.4 ~ 1.21.x" });
-            verBox.setSelectedIndex(V21WD);
-            form.add(verBox, g);
+            f.verBox.setSelectedIndex(V21WD);
+            form.add(f.verBox, g);
             g.gridx = 2; g.fill = java.awt.GridBagConstraints.NONE;
             form.add(new JLabel(t("(后续支持更多版本)", "(more versions later)")), g);
             row++;
@@ -1154,19 +1163,19 @@ public class FindMushroomIslands {
             g.gridx = 0; g.gridy = row;
             form.add(new JLabel(t("世界类型:", "World type:")), g);
             g.gridx = 1; g.fill = java.awt.GridBagConstraints.HORIZONTAL;
-            worldBox = new JComboBox<>(new String[] {
+            f.worldBox = new JComboBox<>(new String[] {
                     t("普通世界", "Default"), t("大型生物群系", "Large Biomes") });
-            form.add(worldBox, g);
+            form.add(f.worldBox, g);
             g.gridx = 2; g.fill = java.awt.GridBagConstraints.NONE;
             form.add(new JLabel(""), g);
             row++;
 
-            minXf = new JTextField("-16384");
-            maxXf = new JTextField("16384");
-            minZf = new JTextField("-16384");
-            maxZf = new JTextField("16384");
+            f.minXf = new JTextField("-16384");
+            f.maxXf = new JTextField("16384");
+            f.minZf = new JTextField("-16384");
+            f.maxZf = new JTextField("16384");
             String[] boundLabels = { "MinX:", "MaxX:", "MinZ:", "MaxZ:" };
-            JTextField[] boundFields = { minXf, maxXf, minZf, maxZf };
+            JTextField[] boundFields = { f.minXf, f.maxXf, f.minZf, f.maxZf };
             for (int i = 0; i < 4; i++) {
                 g.gridx = 0; g.gridy = row;
                 form.add(new JLabel(boundLabels[i]), g);
@@ -1177,18 +1186,18 @@ public class FindMushroomIslands {
                 row++;
             }
 
-            sideCheck = new JCheckBox(t("正方形区域边长:", "Square region side:"), true);
+            f.sideCheck = new JCheckBox(t("正方形区域边长:", "Square region side:"), true);
             g.gridx = 0; g.gridy = row;
-            form.add(sideCheck, g);
+            form.add(f.sideCheck, g);
             g.gridx = 1; g.fill = java.awt.GridBagConstraints.HORIZONTAL;
-            sideField = new JTextField("32768");
-            sideField.getDocument().addDocumentListener(
+            f.sideField = new JTextField("32768");
+            f.sideField.getDocument().addDocumentListener(
                     new javax.swing.event.DocumentListener() {
-                public void insertUpdate(javax.swing.event.DocumentEvent e) { applySide(); }
-                public void removeUpdate(javax.swing.event.DocumentEvent e) { applySide(); }
-                public void changedUpdate(javax.swing.event.DocumentEvent e) { applySide(); }
+                public void insertUpdate(javax.swing.event.DocumentEvent e) { applySide(f); }
+                public void removeUpdate(javax.swing.event.DocumentEvent e) { applySide(f); }
+                public void changedUpdate(javax.swing.event.DocumentEvent e) { applySide(f); }
             });
-            form.add(sideField, g);
+            form.add(f.sideField, g);
             g.gridx = 2; g.fill = java.awt.GridBagConstraints.NONE;
             form.add(new JLabel(t("方块", "blocks")), g);
             row++;
@@ -1196,36 +1205,36 @@ public class FindMushroomIslands {
             g.gridx = 0; g.gridy = row;
             form.add(new JLabel(t("语言:", "Language:")), g);
             g.gridx = 1; g.fill = java.awt.GridBagConstraints.HORIZONTAL;
-            langBox = new JComboBox<>(new String[] { "中文", "English" });
-            langBox.setSelectedIndex(LANG_EN ? 1 : 0);
-            langBox.addActionListener(e -> {
-                int idx = langBox.getSelectedIndex();
+            f.langBox = new JComboBox<>(new String[] { "中文", "English" });
+            f.langBox.setSelectedIndex(LANG_EN ? 1 : 0);
+            f.langBox.addActionListener(e -> {
+                int idx = f.langBox.getSelectedIndex();
                 if ((LANG_EN ? 1 : 0) != idx) {
                     LANG_EN = idx == 1;
                     buildUi();
                 }
             });
-            form.add(langBox, g);
+            form.add(f.langBox, g);
             g.gridx = 2; g.fill = java.awt.GridBagConstraints.NONE;
             form.add(new JLabel(""), g);
             row++;
 
-            if (listMode) {
+            if (f.listMode) {
                 g.gridx = 0; g.gridy = row;
                 form.add(new JLabel(t("种子列表文件:", "Seed list file:")), g);
                 g.gridx = 1; g.fill = java.awt.GridBagConstraints.HORIZONTAL;
-                listFileField = new JTextField();
-                form.add(listFileField, g);
+                f.listFileField = new JTextField();
+                form.add(f.listFileField, g);
                 g.gridx = 2; g.fill = java.awt.GridBagConstraints.NONE;
-                browseBtn = new JButton(t("浏览...", "Browse..."));
-                browseBtn.addActionListener(e -> chooseListFile());
-                form.add(browseBtn, g);
+                f.browseBtn = new JButton(t("浏览...", "Browse..."));
+                f.browseBtn.addActionListener(e -> chooseListFile(f));
+                form.add(f.browseBtn, g);
                 row++;
             }
 
             // 中央寄语 + 作者
             JPanel credit = new JPanel(new java.awt.GridLayout(0, 1));
-            String[] lines = listMode
+            String[] lines = f.listMode
                 ? new String[] { t("每一个种子", "Every seed"),
                                  t("都值得一次蘑菇岛之旅", "deserves a mushroom journey"),
                                  "—— HYChyc114514",
@@ -1244,33 +1253,33 @@ public class FindMushroomIslands {
 
             // 按钮行
             JPanel btns = new JPanel();
-            startBtn = new JButton(t("开始搜索", "Start"));
-            pauseBtn = new JButton(t("暂停", "Pause"));
-            stopBtn = new JButton(t("停止", "Stop"));
-            resetBtn = new JButton(t("重置搜索区域为±16384", "Reset region to ±16384"));
-            selfTestBtn = new JButton(t("算法自检", "Self test"));
-            pauseBtn.setEnabled(false);
-            stopBtn.setEnabled(false);
-            startBtn.addActionListener(e -> startSearch(listMode));
-            pauseBtn.addActionListener(e -> {
+            f.startBtn = new JButton(t("开始搜索", "Start"));
+            f.pauseBtn = new JButton(t("暂停", "Pause"));
+            f.stopBtn = new JButton(t("停止", "Stop"));
+            f.resetBtn = new JButton(t("重置搜索区域为±16384", "Reset region to ±16384"));
+            f.selfTestBtn = new JButton(t("算法自检", "Self test"));
+            f.pauseBtn.setEnabled(false);
+            f.stopBtn.setEnabled(false);
+            f.startBtn.addActionListener(e -> startSearch(f));
+            f.pauseBtn.addActionListener(e -> {
                 pauseFlag = !pauseFlag;
-                pauseBtn.setText(pauseFlag ? t("继续", "Resume") : t("暂停", "Pause"));
+                f.pauseBtn.setText(pauseFlag ? t("继续", "Resume") : t("暂停", "Pause"));
             });
-            stopBtn.addActionListener(e -> stopFlag = true);
-            resetBtn.addActionListener(e -> {
-                minXf.setText("-16384"); maxXf.setText("16384");
-                minZf.setText("-16384"); maxZf.setText("16384");
-                sideField.setText("32768");
+            f.stopBtn.addActionListener(e -> stopFlag = true);
+            f.resetBtn.addActionListener(e -> {
+                f.minXf.setText("-16384"); f.maxXf.setText("16384");
+                f.minZf.setText("-16384"); f.maxZf.setText("16384");
+                f.sideField.setText("32768");
             });
-            selfTestBtn.addActionListener(e -> new Thread(() -> {
+            f.selfTestBtn.addActionListener(e -> new Thread(() -> {
                 String res = runGoldenTest();
                 SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(
                         this, res,
                         t("算法自检 (cubiomes 基准)", "Self test (cubiomes golden)"),
                         JOptionPane.INFORMATION_MESSAGE));
             }).start());
-            btns.add(startBtn); btns.add(pauseBtn); btns.add(stopBtn);
-            btns.add(resetBtn); btns.add(selfTestBtn);
+            btns.add(f.startBtn); btns.add(f.pauseBtn); btns.add(f.stopBtn);
+            btns.add(f.resetBtn); btns.add(f.selfTestBtn);
             g.gridx = 0; g.gridy = row; g.gridwidth = 3;
             g.fill = java.awt.GridBagConstraints.HORIZONTAL;
             form.add(btns, g);
@@ -1278,22 +1287,22 @@ public class FindMushroomIslands {
             row++;
 
             // 进度
-            bar = new JProgressBar(0, 10000);
-            progressLabel = new JLabel(
+            f.bar = new JProgressBar(0, 10000);
+            f.progressLabel = new JLabel(
                     t("进度: 0/0 (0.00%)", "Progress: 0/0 (0.00%)"),
                     SwingConstants.CENTER);
-            progressLabel.setForeground(new java.awt.Color(0, 100, 220));
+            f.progressLabel.setForeground(new java.awt.Color(0, 100, 220));
             g.gridx = 0; g.gridy = row; g.gridwidth = 3;
             g.fill = java.awt.GridBagConstraints.HORIZONTAL;
-            form.add(bar, g); row++;
+            form.add(f.bar, g); row++;
             g.gridx = 0; g.gridy = row; g.gridwidth = 3;
-            form.add(progressLabel, g); row++;
-            elapsedLabel = new JLabel(t("已过时间: 0天0时0分0秒", "Elapsed: 0d0h0m0s"));
-            remainLabel = new JLabel(t("剩余时间: 计算中...", "Remaining: ..."));
+            form.add(f.progressLabel, g); row++;
+            f.elapsedLabel = new JLabel(t("已过时间: 0天0时0分0秒", "Elapsed: 0d0h0m0s"));
+            f.remainLabel = new JLabel(t("剩余时间: 计算中...", "Remaining: ..."));
             g.gridx = 0; g.gridy = row; g.gridwidth = 3;
-            form.add(elapsedLabel, g); row++;
+            form.add(f.elapsedLabel, g); row++;
             g.gridx = 0; g.gridy = row; g.gridwidth = 3;
-            form.add(remainLabel, g); row++;
+            form.add(f.remainLabel, g); row++;
             g.gridwidth = 1;
 
             p.add(form, java.awt.BorderLayout.NORTH);
@@ -1302,64 +1311,65 @@ public class FindMushroomIslands {
             JPanel right = new JPanel(new java.awt.BorderLayout(4, 4));
             right.setBorder(BorderFactory.createTitledBorder(
                     " " + t("检查结果", "Results") + " "));
-            output = new JTextArea();
-            output.setEditable(false);
-            output.setFont(new java.awt.Font(java.awt.Font.MONOSPACED, 0, 13));
-            right.add(new JScrollPane(output), java.awt.BorderLayout.CENTER);
+            f.output = new JTextArea();
+            f.output.setEditable(false);
+            f.output.setFont(new java.awt.Font(java.awt.Font.MONOSPACED, 0, 13));
+            right.add(new JScrollPane(f.output), java.awt.BorderLayout.CENTER);
             JPanel rbtns = new JPanel();
-            exportBtn = new JButton(t("导出", "Export"));
-            sortBtn = new JButton(t("排序", "Sort"));
-            exportBtn.addActionListener(e -> exportResults());
-            sortBtn.addActionListener(e -> {
+            f.exportBtn = new JButton(t("导出", "Export"));
+            f.sortBtn = new JButton(t("排序", "Sort"));
+            f.exportBtn.addActionListener(e -> exportResults(f));
+            f.sortBtn.addActionListener(e -> {
                 lastSortByDist = !lastSortByDist;
-                renderLast();
+                renderLast(f);
             });
-            rbtns.add(exportBtn); rbtns.add(sortBtn);
+            rbtns.add(f.exportBtn); rbtns.add(f.sortBtn);
             right.add(rbtns, java.awt.BorderLayout.SOUTH);
             p.add(right, java.awt.BorderLayout.CENTER);
             return p;
         }
 
-        void applySide() {
-            if (sideCheck == null || !sideCheck.isSelected()) return;
+        void applySide(FormRefs f) {
+            if (f.sideCheck == null || !f.sideCheck.isSelected()) return;
             try {
-                int side = Integer.parseInt(sideField.getText().trim());
+                int side = Integer.parseInt(f.sideField.getText().trim());
                 if (side < 64) return;
                 String half = String.valueOf(side / 2);
-                minXf.setText("-" + half);
-                maxXf.setText(half);
-                minZf.setText("-" + half);
-                maxZf.setText(half);
+                f.minXf.setText("-" + half);
+                f.maxXf.setText(half);
+                f.minZf.setText("-" + half);
+                f.maxZf.setText(half);
             } catch (NumberFormatException ignored) {}
         }
 
-        void chooseListFile() {
+        void chooseListFile(FormRefs f) {
             JFileChooser fc = new JFileChooser();
             fc.setFileFilter(new FileNameExtensionFilter("txt / csv", "txt", "csv", "list"));
             if (fc.showOpenDialog(this) == JFileChooser.APPROVE_OPTION)
-                listFileField.setText(fc.getSelectedFile().getAbsolutePath());
+                f.listFileField.setText(fc.getSelectedFile().getAbsolutePath());
         }
 
-        Cfg readCfg() throws Exception {
+        Cfg readCfg(FormRefs f, boolean requireSeed) throws Exception {
             Cfg c = new Cfg();
-            String st = seedField.getText().trim();
-            if (st.isEmpty()) throw new Exception(t("请输入种子", "Please enter a seed"));
+            String st = f.seedField.getText().trim();
+            if (requireSeed && st.isEmpty())
+                throw new Exception(t("请输入种子", "Please enter a seed"));
             c.seedText = st;
             c.seed = parseSeed(st);
-            c.ver = verBox.getSelectedIndex();
-            c.large = worldBox.getSelectedIndex() == 1;
-            c.minX = Integer.parseInt(minXf.getText().trim());
-            c.maxX = Integer.parseInt(maxXf.getText().trim());
-            c.minZ = Integer.parseInt(minZf.getText().trim());
-            c.maxZ = Integer.parseInt(maxZf.getText().trim());
+            c.ver = f.verBox.getSelectedIndex();
+            c.large = f.worldBox.getSelectedIndex() == 1;
+            c.minX = Integer.parseInt(f.minXf.getText().trim());
+            c.maxX = Integer.parseInt(f.maxXf.getText().trim());
+            c.minZ = Integer.parseInt(f.minZf.getText().trim());
+            c.maxZ = Integer.parseInt(f.maxZf.getText().trim());
             if (c.minX >= c.maxX || c.minZ >= c.maxZ)
                 throw new Exception(t("区域范围无效", "Invalid region"));
             final int LIMIT = 30_000_000;
             c.minX = Math.max(-LIMIT, c.minX); c.maxX = Math.min(LIMIT, c.maxX);
             c.minZ = Math.max(-LIMIT, c.minZ); c.maxZ = Math.min(LIMIT, c.maxZ);
-            int th = Integer.parseInt(threadsField.getText().trim());
+            int th = Integer.parseInt(f.threadsField.getText().trim());
             c.threads = Math.max(1, Math.min(512, th));
-            c.minCells = new int[] {4, 4, 16, 128, 512}[filterBox.getSelectedIndex()];
+            c.minCells = new int[] {4, 4, 16, 128, 512}[f.filterBox.getSelectedIndex()];
             c.step = autoStep(c);
             return c;
         }
@@ -1373,16 +1383,16 @@ public class FindMushroomIslands {
             return c;
         }
 
-        void startSearch(boolean listMode) {
+        void startSearch(FormRefs f) {
             final List<Cfg> cfgs = new ArrayList<>();
             try {
-                if (listMode) {
-                    String path = listFileField.getText().trim();
+                if (f.listMode) {
+                    String path = f.listFileField.getText().trim();
                     if (path.isEmpty())
                         throw new Exception(t("请选择种子列表文件", "Choose a seed list file"));
                     List<String> lines = Files.readAllLines(Paths.get(path),
                             StandardCharsets.UTF_8);
-                    Cfg template = readCfg();
+                    Cfg template = readCfg(f, false);
                     for (String ln : lines) {
                         String s = ln.trim();
                         if (s.isEmpty() || s.startsWith("#")) continue;
@@ -1394,7 +1404,7 @@ public class FindMushroomIslands {
                     if (cfgs.isEmpty())
                         throw new Exception(t("列表中没有种子", "No seeds in list"));
                 } else {
-                    cfgs.add(readCfg());
+                    cfgs.add(readCfg(f, true));
                 }
             } catch (Exception ex) {
                 JOptionPane.showMessageDialog(this, ex.getMessage(),
@@ -1403,44 +1413,48 @@ public class FindMushroomIslands {
             }
             pauseFlag = false;
             stopFlag = false;
-            startBtn.setEnabled(false);
-            pauseBtn.setEnabled(true);
-            stopBtn.setEnabled(true);
-            output.setText("");
-            searchThread = new Thread(() -> runSearch(cfgs), "search-main");
+            f.startBtn.setEnabled(false);
+            f.pauseBtn.setEnabled(true);
+            f.stopBtn.setEnabled(true);
+            f.output.setText("");
+            searchThread = new Thread(() -> runSearch(f, cfgs), "search-main");
             searchThread.start();
         }
 
-        void runSearch(List<Cfg> cfgs) {
+        void runSearch(FormRefs f, List<Cfg> cfgs) {
             long t0 = System.currentTimeMillis();
             try {
+                int idx = 0;
                 for (Cfg c : cfgs) {
                     if (stopFlag) break;
-                    ScanUi prog = new ScanUi(t0);
+                    ScanUi prog = new ScanUi(f, t0);
                     List<Island> list = scanSeed(c, prog);
                     if (list == null) break; // 已停止
                     lastIslands = list;
                     lastSeedText = c.seedText;
-                    SwingUtilities.invokeLater(() -> renderSeedResult(c, list));
+                    final boolean append = f.listMode && idx > 0;
+                    SwingUtilities.invokeLater(() -> renderSeedResult(f, c, list, append));
+                    idx++;
                 }
             } catch (Exception ex) {
                 SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
                         "错误: " + ex, t("错误", "Error"), JOptionPane.ERROR_MESSAGE));
             } finally {
                 SwingUtilities.invokeLater(() -> {
-                    startBtn.setEnabled(true);
-                    pauseBtn.setEnabled(false);
-                    stopBtn.setEnabled(false);
-                    pauseBtn.setText(t("暂停", "Pause"));
-                    remainLabel.setText(t("剩余时间: --", "Remaining: --"));
+                    f.startBtn.setEnabled(true);
+                    f.pauseBtn.setEnabled(false);
+                    f.stopBtn.setEnabled(false);
+                    f.pauseBtn.setText(t("暂停", "Pause"));
+                    f.remainLabel.setText(t("剩余时间: --", "Remaining: --"));
                 });
             }
         }
 
         class ScanUi implements Progress {
+            final FormRefs f;
             final long t0;
             volatile long lastS, lastTotal;
-            ScanUi(long t0) { this.t0 = t0; }
+            ScanUi(FormRefs f, long t0) { this.f = f; this.t0 = t0; }
             public void update(long s, long total) { lastS = s; lastTotal = total; }
             public boolean running() {
                 if (stopFlag) return false;
@@ -1453,12 +1467,12 @@ public class FindMushroomIslands {
                 long remain = frac > 0.005 ? (long) ((1 - frac) * el / frac) : -1;
                 final long s = lastS, total = lastTotal;
                 SwingUtilities.invokeLater(() -> {
-                    bar.setValue((int) Math.round(frac * 10000));
-                    progressLabel.setText(String.format(
+                    f.bar.setValue((int) Math.round(frac * 10000));
+                    f.progressLabel.setText(String.format(
                             t("进度: %d/%d (%.2f%%)", "Progress: %d/%d (%.2f%%)"),
                             s, total, frac * 100));
-                    elapsedLabel.setText(t("已过时间: ", "Elapsed: ") + fmtDur(el));
-                    remainLabel.setText(t("剩余时间: ", "Remaining: ") +
+                    f.elapsedLabel.setText(t("已过时间: ", "Elapsed: ") + fmtDur(el));
+                    f.remainLabel.setText(t("剩余时间: ", "Remaining: ") +
                             (remain >= 0 ? t("约 ", "≈ ") + fmtDur(remain)
                                          : t("计算中...", "...")));
                 });
@@ -1466,8 +1480,14 @@ public class FindMushroomIslands {
             }
         }
 
-        void renderSeedResult(Cfg c, List<Island> list) {
+        void renderSeedResult(FormRefs f, Cfg c, List<Island> list) {
+            renderSeedResult(f, c, list, false);
+        }
+
+        void renderSeedResult(FormRefs f, Cfg c, List<Island> list, boolean append) {
             StringBuilder sb = new StringBuilder();
+            if (append)
+                sb.append("\n──────────────────────\n");
             sb.append(t("种子: ", "Seed: ")).append(c.seedText);
             if (!c.seedText.matches("[+-]?\\d+"))
                 sb.append(t("  (数值: ", "  (numeric: ")).append(c.seed).append(")");
@@ -1500,11 +1520,15 @@ public class FindMushroomIslands {
                     "提示: 面积为近似值; 游戏内可用 /locate biome minecraft:mushroom_fields 验证。\n",
                     "Tip: areas are approximate; verify with /locate biome minecraft:mushroom_fields.\n"));
             }
-            output.setText(sb.toString());
-            output.setCaretPosition(0);
+            if (append) {
+                f.output.append(sb.toString());
+            } else {
+                f.output.setText(sb.toString());
+                f.output.setCaretPosition(0);
+            }
         }
 
-        void renderLast() {
+        void renderLast(FormRefs f) {
             if (lastIslands.isEmpty()) return;
             List<Island> copy = new ArrayList<>(lastIslands);
             copy.sort(lastSortByDist
@@ -1513,23 +1537,24 @@ public class FindMushroomIslands {
             Cfg tmp = new Cfg();
             tmp.seedText = lastSeedText;
             tmp.ver = 0;
-            renderSeedResult(tmp, copy);
+            renderSeedResult(f, tmp, copy);
         }
 
-        void exportResults() {
+        void exportResults(FormRefs f) {
             JFileChooser fc = new JFileChooser();
             fc.setSelectedFile(new File("mushroom_islands.txt"));
             if (fc.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
-            File f = fc.getSelectedFile();
+            File file = fc.getSelectedFile();
             try (Writer w = new OutputStreamWriter(
-                    new FileOutputStream(f), StandardCharsets.UTF_8)) {
-                w.write(output.getText());
+                    new FileOutputStream(file), StandardCharsets.UTF_8)) {
+                w.write(f.output.getText());
             } catch (IOException ex) {
                 JOptionPane.showMessageDialog(this, ex.toString(),
                         t("导出失败", "Export failed"), JOptionPane.ERROR_MESSAGE);
             }
         }
     }
+
 
     //==========================================================================
     //                                入口
