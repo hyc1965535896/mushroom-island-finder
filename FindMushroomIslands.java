@@ -23,7 +23,6 @@ import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.atomic.*;
 import javax.swing.*;
-import javax.swing.filechooser.FileNameExtensionFilter;
 
 public class FindMushroomIslands {
 
@@ -1921,7 +1920,7 @@ public class FindMushroomIslands {
         }
     }
 
-    static final String VERSION = "2.1";
+    static final String VERSION = "2.2";
 
     static boolean LANG_EN = false;
 
@@ -2202,7 +2201,12 @@ public class FindMushroomIslands {
             form.add(f.remainLabel, g); row++;
             g.gridwidth = 1;
 
-            p.add(form, java.awt.BorderLayout.NORTH);
+            // 表单放左侧并加滚动: 行数多时小窗口也可滚动看到全部 (修复底部行被裁掉)
+            JScrollPane formScroll = new JScrollPane(form);
+            formScroll.setBorder(null);
+            formScroll.getVerticalScrollBar().setUnitIncrement(16);
+            formScroll.setPreferredSize(new java.awt.Dimension(560, 700));
+            p.add(formScroll, java.awt.BorderLayout.WEST);
 
             // 右侧结果
             JPanel right = new JPanel(new java.awt.BorderLayout(4, 4));
@@ -2241,7 +2245,7 @@ public class FindMushroomIslands {
 
         void chooseListFile(FormRefs f) {
             JFileChooser fc = new JFileChooser();
-            fc.setFileFilter(new FileNameExtensionFilter("txt / csv", "txt", "csv", "list"));
+            fc.setAcceptAllFileFilterUsed(true); // 兼容任意文本文件
             if (fc.showOpenDialog(this) == JFileChooser.APPROVE_OPTION)
                 f.listFileField.setText(fc.getSelectedFile().getAbsolutePath());
         }
@@ -2300,7 +2304,15 @@ public class FindMushroomIslands {
                         if (s.isEmpty() || s.startsWith("#")) continue;
                         Cfg c = cloneCfg(template);
                         c.seedText = s;
-                        c.seed = parseSeed(s);
+                        try {
+                            c.seed = Long.parseLong(s);
+                        } catch (NumberFormatException e) {
+                            // 宽容解析: 行内首个整数视为数字种子, 否则整行按文字种子
+                            java.util.regex.Matcher m = java.util.regex.Pattern
+                                    .compile("[+-]?[0-9]{1,18}").matcher(s);
+                            c.seed = m.find() ? Long.parseLong(m.group())
+                                              : s.hashCode();
+                        }
                         cfgs.add(c);
                     }
                     if (cfgs.isEmpty())
