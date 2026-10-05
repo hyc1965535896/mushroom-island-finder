@@ -1128,6 +1128,8 @@ public class FindMushroomIslands {
         }
         Cfg c = new Cfg();
         boolean stepSet = false;
+        int centerX = 0, centerZ = 0;
+        boolean hasCenter = false;
         c.seedText = args[0];
         c.seed = parseSeed(args[0]);
         for (int i = 1; i < args.length; i++) {
@@ -1141,11 +1143,22 @@ public class FindMushroomIslands {
             case "-mc":   c.ver = parseVer(args[++i]); break;
             case "-large": c.large = true; break;
             case "-gpu":   c.useGpu = true; break;
+            case "-center":
+                String[] cp = args[++i].split(",");
+                centerX = Integer.parseInt(cp[0].trim());
+                centerZ = Integer.parseInt(cp[1].trim());
+                hasCenter = true;
+                break;
             default: System.err.println("未知选项: " + args[i]); return 2;
             }
         }
         if (c.ver < 0) { System.err.println("不支持的版本"); return 2; }
         if (!stepSet) c.step = autoStep(c);
+        if (hasCenter) {
+            int halfX = (c.maxX - c.minX) / 2, halfZ = (c.maxZ - c.minZ) / 2;
+            c.minX = centerX - halfX; c.maxX = centerX + halfX;
+            c.minZ = centerZ - halfZ; c.maxZ = centerZ + halfZ;
+        }
         System.out.printf("种子 %s (%d)  版本 %s  区域 [%d,%d]x[%d,%d]  步长 %d%n",
                 c.seedText, c.seed, VER_NAMES[c.ver],
                 c.minX, c.maxX, c.minZ, c.maxZ, c.step);
@@ -1920,7 +1933,7 @@ public class FindMushroomIslands {
         }
     }
 
-    static final String VERSION = "2.2";
+    static final String VERSION = "2.3";
 
     static boolean LANG_EN = false;
 
