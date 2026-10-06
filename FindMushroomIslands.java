@@ -772,6 +772,8 @@ public class FindMushroomIslands {
     static final class Island {
         int cx, cz, w, h;
         long area;
+        long perimeter;      // 周长(方块): 组件内格子的外露边数 × 步长
+        double compactness;  // 紧凑度 = 4π·面积/周长², 1.0 为正圆, 越小越破碎
         double dist;
     }
 
@@ -884,8 +886,105 @@ public class FindMushroomIslands {
         return finishScan(c, prog, snapshotChunks(ctx));
     }
 
+    /** 文本报告 (GUI 与 CLI 共用)。append=true 时用于多种子累积。 */
+    static String buildReport(Cfg c, List<Island> list, boolean append) {
+        StringBuilder sb = new StringBuilder();
+        if (append)
+            sb.append("\n──────────────────────\n");
+        sb.append(t("种子: ", "Seed: ")).append(c.seedText);
+        if (!c.seedText.matches("[+-]?[0-9]+"))
+            sb.append(t("  (数值: ", "  (numeric: ")).append(c.seed).append(")");
+        sb.append('\n');
+        sb.append(t("版本: ", "Version: ")).append(VER_NAMES[c.ver])
+          .append(c.large ? t("  大型生物群系", "  Large Biomes") : "")
+          .append('\n');
+        sb.append(String.format(
+                t("区域: [%d, %d] x [%d, %d]  分辨率: %d方块/格%n",
+                  "Region: [%d, %d] x [%d, %d]  resolution: %d blocks/cell%n"),
+                c.minX, c.maxX, c.minZ, c.maxZ, c.step));
+        if (c.step >= 1024)
+            sb.append(t("警告: 步长较大, 直径明显小于步长的蘑菇岛可能漏检; 可在\"分辨率\"中选择更细步长。\n",
+                        "Warning: coarse step, islands much smaller than the step may be missed; pick a finer resolution.\n"));
+        if (list.isEmpty()) {
+            sb.append(t("未找到蘑菇岛, 可尝试扩大搜索区域。\n",
+                        "No mushroom island found, try a larger region.\n"));
+        } else {
+            sb.append(String.format(
+                    t("找到 %d 个蘑菇岛 (按面积降序):%n",
+                      "Found %d mushroom island(s):%n"), list.size()));
+            int rank = 1;
+            for (Island isl : list) {
+                sb.append(String.format(
+                        "#%-3d %s (%d, %d)  %s %d x %d  %s ≈ %,d %s  %s %,d  %s %.2f  %s %,d%n",
+                        rank++,
+                        t("中心", "center"), isl.cx, isl.cz,
+                        t("范围", "size"), isl.w, isl.h,
+                        t("面积", "area"), isl.area, t("方块²", "blocks²"),
+                        t("周长", "perim"), isl.perimeter,
+                        t("紧凑度", "compact"), isl.compactness,
+                        t("距原点", "dist"), (long) isl.dist));
+            }
+            sb.append(t(
+                "提示: 面积为近似值; 游戏内可用 /locate biome minecraft:mushroom_fields 验证。\n",
+                "Tip: areas are approximate; verify with /locate biome minecraft:mushroom_fields.\n"));
+        }
+        return sb.toString();
+    }
+
+    static String buildCsv(Cfg c, List<Island> list) {
+        StringBuilder sb = new StringBuilder("\uFEFF"); // BOM: Excel 直开不乱码
+        sb.append("rank,seed,version,x,z,width,height,area,perimeter,compactness,distance\n");
+        String seed = c.seedText.replace("\"", "\"\"");
+        String ver = VER_NAMES[c.ver] + (c.large ? " (LB)" : "");
+        int rank = 1;
+        for (Island i : list) {
+            sb.append(rank++).append(",\"").append(seed).append("\",\"").append(ver).append("\",")
+              .append(i.cx).append(',').append(i.cz).append(',')
+              .append(i.w).append(',').append(i.h).append(',')
+              .append(i.area).append(',').append(i.perimeter).append(',')
+              .append(String.format(java.util.Locale.ROOT, "%.3f", i.compactness))
+              .append(',').append((long) i.dist).append('\n');
+        }
+        return sb.toString();
+    }
+
+    static String jsonStr(String s) {
+        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+    }
+
+    static String buildJson(Cfg c, List<Island> list) {
+        StringBuilder sb = new StringBuilder("{\n");
+        sb.append("  \"seed\": ").append(jsonStr(c.seedText)).append(",\n");
+        sb.append("  \"seedNumeric\": ").append(c.seed).append(",\n");
+        sb.append("  \"version\": ").append(jsonStr(VER_NAMES[c.ver] + (c.large ? " (LB)" : ""))).append(",\n");
+        sb.append("  \"region\": {\"minX\": ").append(c.minX)
+          .append(", \"maxX\": ").append(c.maxX)
+          .append(", \"minZ\": ").append(c.minZ)
+          .append(", \"maxZ\": ").append(c.maxZ)
+          .append(", \"step\": ").append(c.step).append("},\n");
+        sb.append("  \"islands\": [\n");
+        int rank = 1;
+        for (Island i : list) {
+            sb.append("    {\"rank\": ").append(rank)
+              .append(", \"x\": ").append(i.cx)
+              .append(", \"z\": ").append(i.cz)
+              .append(", \"width\": ").append(i.w)
+              .append(", \"height\": ").append(i.h)
+              .append(", \"area\": ").append(i.area)
+              .append(", \"perimeter\": ").append(i.perimeter)
+              .append(", \"compactness\": ").append(String.format(java.util.Locale.ROOT, "%.4f", i.compactness))
+              .append(", \"distance\": ").append((long) i.dist).append('}');
+            sb.append(rank < list.size() ? "," : "");
+            sb.append('\n');
+            rank++;
+        }
+        sb.append("  ]\n}\n");
+        return sb.toString();
+    }
+
     /** 聚类 + 细化 + 面积筛选 (CPU/GPU 共用)。 */
     static List<Island> finishScan(Cfg c, Progress prog, long[] hits) {
+        prog.phase(t("聚类中...", "Clustering..."));
         List<Island> out = coarseIslands(hits, c);
         out.sort((a, b) -> Long.compare(b.area, a.area));
         prog.phase(t("细化中...", "Refining..."));
@@ -934,6 +1033,16 @@ public class FindMushroomIslands {
                 hsUnion(parent, cntA, sumI, sumJ, minI, maxI, minJ, maxJ,
                         k, cellIdx.get((((long) i) << 32) | ((j - 1) & 0xFFFFFFFFL)));
         }
+        // 外露边数: 命中格的 4 邻域中非命中格的数量 (按根分量累计)
+        long[] peri = new long[n];
+        for (int k = 0; k < n; k++) {
+            int i = (int) (hits[k] >>> 32), j = (int) hits[k];
+            int root = hsFind(parent, k);
+            if (!cellIdx.containsKey(packCell(i - 1, j))) peri[root]++;
+            if (!cellIdx.containsKey(packCell(i + 1, j))) peri[root]++;
+            if (!cellIdx.containsKey(packCell(i, j - 1))) peri[root]++;
+            if (!cellIdx.containsKey(packCell(i, j + 1))) peri[root]++;
+        }
         for (int k = 0; k < n; k++) {
             if (hsFind(parent, k) != k) continue;
             Island isl = new Island();
@@ -942,10 +1051,17 @@ public class FindMushroomIslands {
             isl.w = (maxI[k] - minI[k] + 1) * c.step;
             isl.h = (maxJ[k] - minJ[k] + 1) * c.step;
             isl.area = (long) cntA[k] * c.step * c.step;
+            isl.perimeter = peri[k] * c.step;
+            isl.compactness = peri[k] > 0
+                    ? 4 * Math.PI * cntA[k] / ((double) peri[k] * peri[k]) : 1.0;
             isl.dist = Math.hypot(isl.cx, isl.cz);
             out.add(isl);
         }
         return out;
+    }
+
+    static long packCell(int i, int j) {
+        return ((long) i << 32) | (j & 0xFFFFFFFFL);
     }
 
     /** 扫描过程中的实时预览文本 (在后台线程调用)。 */
@@ -1038,7 +1154,7 @@ public class FindMushroomIslands {
         // 最大连通块
         boolean[] vis = new boolean[fw * fh];
         int[] stack = new int[fw * fh];
-        long bestCnt = 0, bestSumI = 0, bestSumJ = 0;
+        long bestCnt = 0, bestSumI = 0, bestSumJ = 0, bestEdges = 0;
         int bi0 = 0, bi1 = 0, bj0 = 0, bj1 = 0;
         for (int start = 0; start < fw * fh; start++) {
             if (m2[start] == 0 || vis[start]) continue;
@@ -1047,6 +1163,7 @@ public class FindMushroomIslands {
             vis[start] = true;
             long cnt = 0, sumI = 0, sumJ = 0;
             int i0 = fw, i1 = -1, j0 = fh, j1 = -1;
+            long edges = 0;
             while (sp > 0) {
                 int cur = stack[--sp];
                 int ci2 = cur % fw, cj2 = cur / fw;
@@ -1055,6 +1172,11 @@ public class FindMushroomIslands {
                 if (ci2 > i1) i1 = ci2;
                 if (cj2 < j0) j0 = cj2;
                 if (cj2 > j1) j1 = cj2;
+                // 外露边: 4 邻域越界或非命中 (含区域边界, 区域已留足余量)
+                if (ci2 == 0      || m2[cur - 1]  == 0) edges++;
+                if (ci2 == fw - 1 || m2[cur + 1]  == 0) edges++;
+                if (cj2 == 0      || m2[cur - fw] == 0) edges++;
+                if (cj2 == fh - 1 || m2[cur + fw] == 0) edges++;
                 if (ci2 > 0      && m2[cur - 1]   == 1 && !vis[cur - 1])  { vis[cur - 1] = true;  stack[sp++] = cur - 1; }
                 if (ci2 < fw - 1 && m2[cur + 1]   == 1 && !vis[cur + 1])  { vis[cur + 1] = true;  stack[sp++] = cur + 1; }
                 if (cj2 > 0      && m2[cur - fw]  == 1 && !vis[cur - fw]) { vis[cur - fw] = true; stack[sp++] = cur - fw; }
@@ -1062,6 +1184,7 @@ public class FindMushroomIslands {
             }
             if (cnt > bestCnt) {
                 bestCnt = cnt; bestSumI = sumI; bestSumJ = sumJ;
+                bestEdges = edges;
                 bi0 = i0; bi1 = i1; bj0 = j0; bj1 = j1;
             }
         }
@@ -1071,6 +1194,9 @@ public class FindMushroomIslands {
             isl.w = (bi1 - bi0 + 1) * fs;
             isl.h = (bj1 - bj0 + 1) * fs;
             isl.area = bestCnt * (long) fs * fs;
+            isl.perimeter = bestEdges * fs;
+            isl.compactness = bestEdges > 0
+                    ? 4 * Math.PI * bestCnt / ((double) bestEdges * bestEdges) : 1.0;
             isl.dist = Math.hypot(isl.cx, isl.cz);
         }
     }
@@ -1130,6 +1256,7 @@ public class FindMushroomIslands {
         boolean stepSet = false;
         int centerX = 0, centerZ = 0;
         boolean hasCenter = false;
+        String outFile = null;
         c.seedText = args[0];
         c.seed = parseSeed(args[0]);
         for (int i = 1; i < args.length; i++) {
@@ -1143,6 +1270,7 @@ public class FindMushroomIslands {
             case "-mc":   c.ver = parseVer(args[++i]); break;
             case "-large": c.large = true; break;
             case "-gpu":   c.useGpu = true; break;
+            case "-o":    outFile = args[++i]; break;
             case "-center":
                 String[] cp = args[++i].split(",");
                 centerX = Integer.parseInt(cp[0].trim());
@@ -1178,11 +1306,23 @@ public class FindMushroomIslands {
             return 0;
         }
         System.out.printf("找到 %d 个蘑菇岛 (耗时 %.1f 秒):%n", list.size(), secs);
+        if (outFile != null) {
+            String s = outFile.toLowerCase(java.util.Locale.ROOT).endsWith(".csv") ? buildCsv(c, list)
+                    : outFile.toLowerCase(java.util.Locale.ROOT).endsWith(".json") ? buildJson(c, list)
+                    : buildReport(c, list, false);
+            try {
+                java.nio.file.Files.writeString(java.nio.file.Path.of(outFile), s);
+                System.out.println("结果已写入 " + outFile);
+            } catch (java.io.IOException ex) {
+                System.out.println("写入失败: " + ex);
+            }
+        }
         int rank = 1;
         for (Island isl : list) {
             System.out.printf(
-                "#%-3d 中心 (%d, %d)  范围 %d x %d  面积 ≈ %,d 方块^2  距原点 %,d%n",
-                rank++, isl.cx, isl.cz, isl.w, isl.h, isl.area, (long) isl.dist);
+                "#%-3d 中心 (%d, %d)  范围 %d x %d  面积 ≈ %,d  周长 %,d  紧凑度 %.2f  距原点 %,d%n",
+                rank++, isl.cx, isl.cz, isl.w, isl.h, isl.area,
+                isl.perimeter, isl.compactness, (long) isl.dist);
         }
         return 0;
     }
@@ -1933,7 +2073,7 @@ public class FindMushroomIslands {
         }
     }
 
-    static final String VERSION = "2.3";
+    static final String VERSION = "2.4";
 
     static boolean LANG_EN = false;
 
@@ -1957,7 +2097,7 @@ public class FindMushroomIslands {
         JTextField seedField, threadsField, minXf, maxXf, minZf, maxZf, sideField, listFileField;
         JComboBox<String> filterBox, verBox, worldBox, langBox, resBox, deviceBox;
         JCheckBox sideCheck;
-        JButton startBtn, pauseBtn, stopBtn, resetBtn, exportBtn, sortBtn, browseBtn, selfTestBtn;
+        JButton startBtn, pauseBtn, stopBtn, resetBtn, exportBtn, sortBtn, browseBtn, selfTestBtn, copyBtn;
         JProgressBar bar;
         JLabel progressLabel, elapsedLabel, remainLabel;
         JTextArea output;
@@ -1969,6 +2109,7 @@ public class FindMushroomIslands {
         Thread searchThread;
         volatile boolean pauseFlag, stopFlag;
         List<Island> lastIslands = new ArrayList<>();
+        Cfg lastCfg;
         String lastSeedText = "";
         boolean lastSortByDist = false;
 
@@ -2233,11 +2374,13 @@ public class FindMushroomIslands {
             f.exportBtn = new JButton(t("导出", "Export"));
             f.sortBtn = new JButton(t("排序", "Sort"));
             f.exportBtn.addActionListener(e -> exportResults(f));
+            f.copyBtn = new JButton(t("复制坐标", "Copy"));
+            f.copyBtn.addActionListener(e -> copyCoords());
             f.sortBtn.addActionListener(e -> {
                 lastSortByDist = !lastSortByDist;
                 renderLast(f);
             });
-            rbtns.add(f.exportBtn); rbtns.add(f.sortBtn);
+            rbtns.add(f.exportBtn); rbtns.add(f.copyBtn); rbtns.add(f.sortBtn);
             right.add(rbtns, java.awt.BorderLayout.SOUTH);
             p.add(right, java.awt.BorderLayout.CENTER);
             return p;
@@ -2360,6 +2503,7 @@ public class FindMushroomIslands {
                     prog.finish();
                     if (list == null) break; // 已停止
                     lastIslands = list;
+                    lastCfg = cloneCfg(c);
                     lastSeedText = c.seedText;
                     final boolean append = f.listMode && idx > 0;
                     SwingUtilities.invokeLater(() -> renderSeedResult(f, c, list, append));
@@ -2434,7 +2578,7 @@ public class FindMushroomIslands {
                 final long s = lastS, total = lastTotal;
                 SwingUtilities.invokeLater(() -> {
                     f.bar.setValue((int) Math.round(frac * 10000));
-                    f.progressLabel.setText(String.format(
+                    f.progressLabel.setText(t("[采样] ", "[Sampling] ") + String.format(
                             t("进度: %d/%d (%.2f%%)", "Progress: %d/%d (%.2f%%)"),
                             s, total, frac * 100));
                     f.elapsedLabel.setText(t("已过时间: ", "Elapsed: ") + fmtDur(el));
@@ -2451,48 +2595,11 @@ public class FindMushroomIslands {
         }
 
         void renderSeedResult(FormRefs f, Cfg c, List<Island> list, boolean append) {
-            StringBuilder sb = new StringBuilder();
-            if (append)
-                sb.append("\n──────────────────────\n");
-            sb.append(t("种子: ", "Seed: ")).append(c.seedText);
-            if (!c.seedText.matches("[+-]?\\d+"))
-                sb.append(t("  (数值: ", "  (numeric: ")).append(c.seed).append(")");
-            sb.append('\n');
-            sb.append(t("版本: ", "Version: ")).append(VER_NAMES[c.ver])
-              .append(c.large ? t("  大型生物群系", "  Large Biomes") : "")
-              .append('\n');
-            sb.append(String.format(
-                    t("区域: [%d, %d] x [%d, %d]  分辨率: %d方块/格%n",
-                      "Region: [%d, %d] x [%d, %d]  resolution: %d blocks/cell%n"),
-                    c.minX, c.maxX, c.minZ, c.maxZ, c.step));
-            if (c.step >= 1024)
-                sb.append(t("警告: 步长较大, 直径明显小于步长的蘑菇岛可能漏检; 可在\"分辨率\"中选择更细步长。\n",
-                            "Warning: coarse step, islands much smaller than the step may be missed; pick a finer resolution.\n"));
-            if (list.isEmpty()) {
-                sb.append(t("未找到蘑菇岛, 可尝试扩大搜索区域。\n",
-                            "No mushroom island found, try a larger region.\n"));
-            } else {
-                sb.append(String.format(
-                        t("找到 %d 个蘑菇岛 (按面积降序):%n",
-                          "Found %d mushroom island(s):%n"), list.size()));
-                int rank = 1;
-                for (Island isl : list) {
-                    sb.append(String.format(
-                            "#%-3d %s (%d, %d)  %s %d x %d  %s ≈ %,d %s  %s %,d%n",
-                            rank++,
-                            t("中心", "center"), isl.cx, isl.cz,
-                            t("范围", "size"), isl.w, isl.h,
-                            t("面积", "area"), isl.area, t("方块²", "blocks²"),
-                            t("距原点", "dist"), (long) isl.dist));
-                }
-                sb.append(t(
-                    "提示: 面积为近似值; 游戏内可用 /locate biome minecraft:mushroom_fields 验证。\n",
-                    "Tip: areas are approximate; verify with /locate biome minecraft:mushroom_fields.\n"));
-            }
+            String s = buildReport(c, list, append);
             if (append) {
-                f.output.append(sb.toString());
+                f.output.append(s);
             } else {
-                f.output.setText(sb.toString());
+                f.output.setText(s);
                 f.output.setCaretPosition(0);
             }
         }
@@ -2503,24 +2610,50 @@ public class FindMushroomIslands {
             copy.sort(lastSortByDist
                     ? Comparator.comparingDouble(i -> i.dist)
                     : (a, b) -> Long.compare(b.area, a.area));
-            Cfg tmp = new Cfg();
+            Cfg tmp = lastCfg != null ? lastCfg : new Cfg();
             tmp.seedText = lastSeedText;
-            tmp.ver = 0;
             renderSeedResult(f, tmp, copy);
         }
 
         void exportResults(FormRefs f) {
+            if (lastCfg == null || lastIslands.isEmpty()) {
+                JOptionPane.showMessageDialog(this,
+                        t("还没有可导出的结果", "Nothing to export yet"),
+                        t("导出", "Export"), JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+            int fmt = JOptionPane.showOptionDialog(this,
+                    t("选择导出格式:", "Choose export format:"),
+                    t("导出", "Export"), JOptionPane.DEFAULT_OPTION,
+                    JOptionPane.QUESTION_MESSAGE, null,
+                    new Object[]{"TXT", "CSV", "JSON"}, "CSV");
+            if (fmt < 0) return;
+            String[] ext = {"txt", "csv", "json"};
             JFileChooser fc = new JFileChooser();
-            fc.setSelectedFile(new File("mushroom_islands.txt"));
+            fc.setSelectedFile(new File("mushroom_islands." + ext[fmt]));
             if (fc.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
             File file = fc.getSelectedFile();
+            String s = fmt == 1 ? buildCsv(lastCfg, lastIslands)
+                     : fmt == 2 ? buildJson(lastCfg, lastIslands)
+                     : buildReport(lastCfg, lastIslands, false);
             try (Writer w = new OutputStreamWriter(
                     new FileOutputStream(file), StandardCharsets.UTF_8)) {
-                w.write(f.output.getText());
+                w.write(s);
             } catch (IOException ex) {
                 JOptionPane.showMessageDialog(this, ex.toString(),
                         t("导出失败", "Export failed"), JOptionPane.ERROR_MESSAGE);
             }
+        }
+
+        void copyCoords() {
+            if (lastIslands.isEmpty()) return;
+            StringBuilder sb = new StringBuilder();
+            for (Island isl : lastIslands)
+                sb.append(isl.cx).append(' ').append(isl.cz).append('\n');
+            java.awt.datatransfer.StringSelection sel =
+                    new java.awt.datatransfer.StringSelection(sb.toString());
+            java.awt.Toolkit.getDefaultToolkit().getSystemClipboard()
+                    .setContents(sel, sel);
         }
     }
 
